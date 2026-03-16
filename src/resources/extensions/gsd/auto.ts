@@ -824,6 +824,23 @@ export async function startAuto(
 
   let state = await deriveState(base);
 
+  // ── Stale worktree state recovery (#654) ─────────────────────────────────
+  // When auto-mode was previously stopped and restarted, the project root's
+  // .gsd/ directory may have stale metadata (completed units showing as
+  // incomplete). If an auto-worktree exists for the active milestone, it has
+  // the current state — re-derive from there to avoid re-dispatching
+  // finished work.
+  if (
+    state.activeMilestone &&
+    shouldUseWorktreeIsolation() &&
+    !detectWorktreeName(base)
+  ) {
+    const wtPath = getAutoWorktreePath(base, state.activeMilestone.id);
+    if (wtPath) {
+      state = await deriveState(wtPath);
+    }
+  }
+
   // ── Milestone branch recovery (#601) ─────────────────────────────────────
   // When auto-mode was previously stopped, the milestone branch is preserved
   // but the worktree is removed. The project root (integration branch) may
