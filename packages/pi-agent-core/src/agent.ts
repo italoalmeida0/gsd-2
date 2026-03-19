@@ -14,7 +14,7 @@ import {
 	type ThinkingBudgets,
 	type Transport,
 } from "@gsd/pi-ai";
-import { agentLoop, agentLoopContinue } from "./agent-loop.js";
+import { agentLoop, agentLoopContinue, ZERO_USAGE } from "./agent-loop.js";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -557,14 +557,7 @@ export class Agent {
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
+				usage: ZERO_USAGE,
 				stopReason: this.abortController?.signal.aborted ? "aborted" : "error",
 				errorMessage: err?.message || String(err),
 				timestamp: Date.now(),

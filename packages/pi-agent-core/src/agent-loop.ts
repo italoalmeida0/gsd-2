@@ -22,7 +22,7 @@ import type {
 	StreamFn,
 } from "./types.js";
 
-const ZERO_USAGE = {
+export const ZERO_USAGE = {
 	input: 0,
 	output: 0,
 	cacheRead: 0,
@@ -199,14 +199,7 @@ async function runLoop(
 					api: config.model.api,
 					provider: config.model.provider,
 					model: config.model.id,
-					usage: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
+					usage: ZERO_USAGE,
 					stopReason: signal?.aborted ? "aborted" : "error",
 					errorMessage: errorText,
 					timestamp: Date.now(),
