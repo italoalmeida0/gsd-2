@@ -20,12 +20,14 @@ export interface GraphStep {
   id: string;
   /** Human-readable step title. */
   title: string;
-  /** Current status: pending → active → complete. */
-  status: "pending" | "active" | "complete";
+  /** Current status: pending → active → complete → expanded (iterate parent). */
+  status: "pending" | "active" | "complete" | "expanded";
   /** The prompt to dispatch for this step. */
   prompt: string;
   /** IDs of steps that must be "complete" before this step can run. */
   dependsOn: string[];
+  /** For iteration instances: ID of the parent step that was expanded. */
+  parentStepId?: string;
 }
 
 export interface WorkflowGraph {
@@ -52,6 +54,7 @@ interface YamlStep {
   status: string;
   prompt: string;
   depends_on?: string[];
+  parent_step_id?: string;
 }
 
 interface YamlGraph {
@@ -87,6 +90,7 @@ export function readGraph(runDir: string): WorkflowGraph {
       status: s.status as GraphStep["status"],
       prompt: s.prompt,
       dependsOn: s.depends_on ?? [],
+      ...(s.parent_step_id != null ? { parentStepId: s.parent_step_id } : {}),
     })),
     metadata: {
       name: yaml.metadata?.name ?? "unnamed",
@@ -114,6 +118,7 @@ export function writeGraph(runDir: string, graph: WorkflowGraph): void {
       status: s.status,
       prompt: s.prompt,
       depends_on: s.dependsOn.length > 0 ? s.dependsOn : undefined,
+      parent_step_id: s.parentStepId ?? undefined,
     })) as YamlStep[],
     metadata: {
       name: graph.metadata.name,
@@ -175,6 +180,86 @@ export function markStepComplete(
     steps: graph.steps.map((s) =>
       s.id === stepId ? { ...s, status: "complete" as const } : s,
     ),
+  };
+}
+
+// ─── Iteration expansion ─────────────────────────────────────────────────
+
+/**
+ * Expand an iterate step into concrete instances. Pure and deterministic —
+ * identical inputs always produce identical output.
+ *
+ * Given a parent step with status "pending" and an array of matched items,
+ * creates one instance step per item, marks the parent as "expanded", and
+ * rewrites any downstream dependsOn references from the parent ID to the
+ * full set of instance IDs.
+ *
+ * @param graph — the current workflow graph (not mutated)
+ * @param stepId — ID of the iterate step to expand
+ * @param items — matched items from the source artifact
+ * @param promptTemplate — template with {{item}} placeholders
+ * @returns New WorkflowGraph with instances inserted and deps rewritten
+ * @throws Error if stepId not found or step is not pending
+ */
+export function expandIteration(
+  graph: WorkflowGraph,
+  stepId: string,
+  items: string[],
+  promptTemplate: string,
+): WorkflowGraph {
+  const parentIndex = graph.steps.findIndex((s) => s.id === stepId);
+  if (parentIndex === -1) {
+    throw new Error(`expandIteration: step not found: ${stepId}`);
+  }
+  const parentStep = graph.steps[parentIndex];
+  if (parentStep.status !== "pending") {
+    throw new Error(
+      `expandIteration: step "${stepId}" has status "${parentStep.status}", expected "pending"`,
+    );
+  }
+
+  // Create instance steps
+  const instanceIds: string[] = [];
+  const instances: GraphStep[] = items.map((item, i) => {
+    const instanceId = `${stepId}--${String(i + 1).padStart(3, "0")}`;
+    instanceIds.push(instanceId);
+    return {
+      id: instanceId,
+      title: `${parentStep.title}: ${item}`,
+      status: "pending" as const,
+      prompt: promptTemplate.replace(/\{\{item\}\}/g, item),
+      dependsOn: [...parentStep.dependsOn],
+      parentStepId: stepId,
+    };
+  });
+
+  // Build new steps array: copy everything, mark parent as expanded,
+  // insert instances right after the parent, rewrite downstream deps.
+  const newSteps: GraphStep[] = [];
+  for (let i = 0; i < graph.steps.length; i++) {
+    if (i === parentIndex) {
+      // Mark parent as expanded
+      newSteps.push({ ...parentStep, status: "expanded" as const });
+      // Insert instances immediately after parent
+      newSteps.push(...instances);
+    } else {
+      const step = graph.steps[i];
+      // Rewrite dependsOn: replace parent ID with all instance IDs
+      const hasDep = step.dependsOn.includes(stepId);
+      if (hasDep) {
+        const rewritten = step.dependsOn.flatMap((dep) =>
+          dep === stepId ? instanceIds : [dep],
+        );
+        newSteps.push({ ...step, dependsOn: rewritten });
+      } else {
+        newSteps.push(step);
+      }
+    }
+  }
+
+  return {
+    ...graph,
+    steps: newSteps,
   };
 }
 
