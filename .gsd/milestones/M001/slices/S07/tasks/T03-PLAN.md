@@ -92,3 +92,9 @@ The prompt is the key UX deliverable for R012. It must embed enough schema knowl
 ## Expected Output
 
 - `src/resources/extensions/gsd/prompts/workflow-builder.md` — new: LLM builder conversation prompt (~150-250 lines of structured markdown)
+
+## Observability Impact
+
+- **Inspection surface**: `loadPrompt("workflow-builder", { defsDir, schemaVersion })` — returns the fully-resolved prompt text. Any unresolved `{{var}}` triggers a `GSDError` with `GSD_PARSE_ERROR` code listing the missing variable names.
+- **Failure visibility**: If the prompt file is missing or malformed, `handleNew()` in `commands-workflow.ts` catches the error and surfaces it via `ctx.ui.notify()` with the full error message.
+- **Cache behavior**: The prompt is eagerly cached by `warmCache()` at module init. If the file changes on disk after init, the cached version is used for the remainder of the session.
