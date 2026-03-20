@@ -37,17 +37,6 @@ This file is the explicit capability and coverage contract for the project.
 - Validation: S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys. Not yet consumed — S02 uses for engine construction.
 - Notes: The decomposition must be mechanical — same functions, grouped differently. No behavior change.
 
-### R004 — The existing dev workflow (milestones/slices/tasks, `deriveState()`, `DISPATCH_RULES[]`, auto-commit, doctor, worktree sync) is wrapped in a `DevWorkflowEngine` that implements the `WorkflowEngine` interface. All 172 existing tests pass identically.
-- Class: core-capability
-- Status: active
-- Description: The existing dev workflow (milestones/slices/tasks, `deriveState()`, `DISPATCH_RULES[]`, auto-commit, doctor, worktree sync) is wrapped in a `DevWorkflowEngine` that implements the `WorkflowEngine` interface. All 172 existing tests pass identically.
-- Why it matters: The dev workflow is the production workhorse. If the abstraction breaks it, the project fails.
-- Source: user
-- Primary owning slice: M001/S02
-- Supporting slices: none
-- Validation: S02 T01: DevWorkflowEngine class in dev-workflow-engine.ts implements WorkflowEngine, delegates deriveState/resolveDispatch to existing functions. S02 T02: Wired into dispatchNextUnit(), all 1862+ unit tests pass identically.
-- Notes: Zero behavior change is a hard constraint. Test suite is the verification.
-
 ### R005 — A `resolveEngine()` function in the auto-loop checks an `active-engine` file to determine whether to use `DevWorkflowEngine` or `CustomWorkflowEngine`. Defaults to dev when no pointer exists.
 - Class: core-capability
 - Status: active
@@ -182,6 +171,17 @@ This file is the explicit capability and coverage contract for the project.
 
 ## Validated
 
+### R004 — The existing dev workflow (milestones/slices/tasks, `deriveState()`, `DISPATCH_RULES[]`, auto-commit, doctor, worktree sync) is wrapped in a `DevWorkflowEngine` that implements the `WorkflowEngine` interface. All 172 existing tests pass identically.
+- Class: core-capability
+- Status: validated
+- Description: The existing dev workflow (milestones/slices/tasks, `deriveState()`, `DISPATCH_RULES[]`, auto-commit, doctor, worktree sync) is wrapped in a `DevWorkflowEngine` that implements the `WorkflowEngine` interface. All 172 existing tests pass identically.
+- Why it matters: The dev workflow is the production workhorse. If the abstraction breaks it, the project fails.
+- Source: user
+- Primary owning slice: M001/S02
+- Supporting slices: none
+- Validation: S02 T01: DevWorkflowEngine class in dev-workflow-engine.ts implements WorkflowEngine, delegates deriveState() to state.ts:deriveState() and resolveDispatch() to auto-dispatch.ts:resolveDispatch() with bridgeDispatchAction conversion. S02 T02: Wired into dispatchNextUnit() at 4 sites — resolveEngine(s) at entry, engine.deriveState() for initial derivation, engine.resolveDispatch() for dispatch resolution. All 1590 tests pass identically (1 pre-existing fail L001, 3 skipped). 18-assertion contract test validates all shapes.
+- Notes: Zero behavior change is a hard constraint. Test suite is the verification.
+
 ### R016 — The existing dev workflow (milestones/slices/tasks) must be identical before and after the interface extraction. All 172 existing tests pass. No behavior change in state derivation, dispatch, post-unit processing, verification, or worktree management.
 - Class: constraint
 - Status: validated
@@ -292,7 +292,7 @@ This file is the explicit capability and coverage contract for the project.
 | R001 | core-capability | active | M001/S01 | M001/S02 | S01: WorkflowEngine interface defined in workflow-engine.ts with engineId + deriveState/resolveDispatch/reconcile/getDisplayMetadata. Compiles cleanly. Contract test validates shape (19/19 pass). Not yet wired — S02 implements. |
 | R002 | core-capability | active | M001/S01 | M001/S02 | S01: ExecutionPolicy interface defined in execution-policy.ts with prepareWorkspace/selectModel/verify/recover/closeout. Compiles cleanly. Contract test validates shape. Not yet wired — S02 implements. |
 | R003 | quality-attribute | active | M001/S01 | none | S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys. Not yet consumed — S02 uses for engine construction. |
-| R004 | core-capability | active | M001/S02 | none | S02 T01: DevWorkflowEngine class in dev-workflow-engine.ts implements WorkflowEngine, delegates deriveState/resolveDispatch to existing functions. S02 T02: Wired into dispatchNextUnit(), all 1862+ unit tests pass identically. |
+| R004 | core-capability | validated | M001/S02 | none | S02 T01: DevWorkflowEngine class in dev-workflow-engine.ts implements WorkflowEngine, delegates deriveState() to state.ts:deriveState() and resolveDispatch() to auto-dispatch.ts:resolveDispatch() with bridgeDispatchAction conversion. S02 T02: Wired into dispatchNextUnit() at 4 sites — resolveEngine(s) at entry, engine.deriveState() for initial derivation, engine.resolveDispatch() for dispatch resolution. All 1590 tests pass identically (1 pre-existing fail L001, 3 skipped). 18-assertion contract test validates all shapes. |
 | R005 | core-capability | active | M001/S02 | M001/S03 | S02 T01: resolveEngine() in engine-resolver.ts returns DevWorkflowEngine for null/"dev" activeEngineId, throws for unknown. S02 T02: Called in dispatchNextUnit(), session.activeEngineId drives resolution. |
 | R006 | core-capability | active | M001/S04 | M001/S07 | unmapped |
 | R007 | continuity | active | M001/S04 | none | unmapped |
@@ -317,7 +317,7 @@ This file is the explicit capability and coverage contract for the project.
 
 ## Coverage Summary
 
-- Active requirements: 16
-- Mapped to slices: 16
-- Validated: 1 (R016)
+- Active requirements: 15
+- Mapped to slices: 15
+- Validated: 2 (R004, R016)
 - Unmapped active requirements: 0
