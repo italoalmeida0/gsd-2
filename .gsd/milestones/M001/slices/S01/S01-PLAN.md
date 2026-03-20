@@ -52,7 +52,7 @@
   - Verify: `npx tsc --noEmit` passes. `npm run test:unit -- --test-name-pattern "session-encapsulation"` passes (verifies AutoSession invariants).
   - Done when: `loop-deps-groups.ts` exists with typed sub-interfaces covering all dependency clusters, `AutoSession` has `activeEngineId` field passing encapsulation tests
 
-- [ ] **T03: Write contract test and run full test suite verification** `est:30m`
+- [x] **T03: Write contract test and run full test suite verification** `est:30m`
   - Why: R016 requires zero behavior change proven by the test suite. A contract test validates the new interfaces are well-formed and importable. Running the full suite proves no regressions.
   - Files: `src/resources/extensions/gsd/tests/engine-interfaces-contract.test.ts`
   - Do: Write a test file using Node.js built-in test runner that: (1) imports all four new files and asserts they export the expected interfaces/types, (2) verifies `EngineState` has the expected shape fields, (3) verifies `WorkflowEngine` and `ExecutionPolicy` method names exist as interface properties, (4) verifies `AutoSession` has `activeEngineId` field. Then run `npm run test:unit` and `npm run test:integration` to prove zero regressions. If any test fails, investigate and fix — the failure is a bug in T01/T02, not an expected outcome.
