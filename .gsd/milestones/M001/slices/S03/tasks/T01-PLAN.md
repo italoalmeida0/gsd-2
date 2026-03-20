@@ -57,3 +57,10 @@ The central challenge is the GSDState stub: `dispatchNextUnit()` in `auto.ts` ha
 - `src/resources/extensions/gsd/custom-workflow-engine.ts` — ~120 lines, CustomWorkflowEngine class
 - `src/resources/extensions/gsd/custom-execution-policy.ts` — ~50 lines, stub policy
 - `src/resources/extensions/gsd/engine-resolver.ts` — ~55 lines (was ~42), with custom branch added
+
+## Observability Impact
+
+- **resolveEngine routing**: Now has 3 code paths — `"dev"`, `"custom:*"` prefix, and unknown-throw. The `"Unknown engine: ${id}"` error message is preserved unchanged for IDs that match neither prefix.
+- **GRAPH.yaml as inspection surface**: `readGraph()` throws descriptive errors for missing files (`"GRAPH.yaml not found: <path>"`) and malformed YAML (`"Invalid GRAPH.yaml: missing or invalid 'steps' array"`). These errors surface through `deriveState()` to the auto-loop.
+- **Step dispatch visibility**: `resolveDispatch()` returns `{ action: "stop", reason: "All steps complete", level: "info" }` when the graph has no pending steps — visible in auto-loop logging.
+- **GSDState stub safety**: The stub in `EngineState.raw` uses `activeMilestone: { id: "custom-workflow" }` and `phase: "executing"` to prevent early-exit guards in `dispatchNextUnit()` from short-circuiting before `resolveDispatch()` runs.
