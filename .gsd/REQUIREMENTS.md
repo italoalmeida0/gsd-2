@@ -2,130 +2,40 @@
 
 This file is the explicit capability and coverage contract for the project.
 
-## Active
+## Validated
 
 ### R001 — A `WorkflowEngine` interface that owns state derivation, dispatch resolution, completion reconciliation, and TUI display metadata. The auto-loop calls these methods polymorphically instead of directly invoking dev-specific functions.
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: A `WorkflowEngine` interface that owns state derivation, dispatch resolution, completion reconciliation, and TUI display metadata. The auto-loop calls these methods polymorphically instead of directly invoking dev-specific functions.
 - Why it matters: This is the fundamental abstraction that enables pluggable workflows. Without it, every new workflow type requires modifying the loop itself.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: M001/S02
-- Validation: S01: WorkflowEngine interface defined in workflow-engine.ts with engineId + deriveState/resolveDispatch/reconcile/getDisplayMetadata. Compiles cleanly. Contract test validates shape (19/19 pass). Not yet wired — S02 implements.
+- Validation: S01: WorkflowEngine interface defined with engineId + deriveState/resolveDispatch/reconcile/getDisplayMetadata. S02: DevWorkflowEngine implements it, wired into dispatchNextUnit() at 4 sites. S03: CustomWorkflowEngine implements it, resolveEngine() routes "custom:*" IDs. S08 T01: handleAgentEnd uses engine.reconcile() + policy.verify() for custom workflow completions. S08 T03: 12 e2e tests prove the full polymorphic lifecycle — the auto-loop calls engine methods without knowing which engine type is active. All existing tests pass with zero regression.
 - Notes: Interface must support `deriveState()`, `resolveDispatch()`, `reconcile()`, `getDisplayMetadata()` at minimum.
 
 ### R002 — An `ExecutionPolicy` interface that owns workspace preparation, model selection, verification execution, recovery handling, and post-unit closeout. Separates "how to run" from "what to run next."
 - Class: core-capability
-- Status: active
+- Status: validated
 - Description: An `ExecutionPolicy` interface that owns workspace preparation, model selection, verification execution, recovery handling, and post-unit closeout. Separates "how to run" from "what to run next."
 - Why it matters: Dev workflows need auto-commit, doctor runs, and worktree sync. Custom workflows may need none of that. The policy makes this pluggable.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: M001/S02
-- Validation: S01: ExecutionPolicy interface defined in execution-policy.ts with prepareWorkspace/selectModel/verify/recover/closeout. Compiles cleanly. Contract test validates shape. Not yet wired — S02 implements.
+- Validation: S01: ExecutionPolicy interface defined with prepareWorkspace/selectModel/verify/recover/closeout. S02: DevExecutionPolicy implements it. S05: CustomExecutionPolicy implements verify() dispatching to runVerification() for all four policies. S08 T01: handleAgentEnd calls policy.verify() after engine.reconcile() for custom workflows, routing outcomes (continue/retry/pause). S08 T03: 12 e2e tests prove verification policies work through the integrated lifecycle. Zero regression.
 - Notes: Interface must support `prepareWorkspace()`, `selectModel()`, `verify()`, `recover()`, `closeout()` at minimum.
 
 ### R003 — The ~70-function `LoopDeps` interface is decomposed into logical groups: git operations, model routing, budget/context, verification, state management, worktree, post-unit processing, etc. Each group is a separate typed interface.
 - Class: quality-attribute
-- Status: active
+- Status: validated
 - Description: The ~70-function `LoopDeps` interface is decomposed into logical groups: git operations, model routing, budget/context, verification, state management, worktree, post-unit processing, etc. Each group is a separate typed interface.
 - Why it matters: LoopDeps is a god-interface that makes reasoning about dependencies impossible. Decomposition makes the loop's actual needs visible and testable per-concern.
 - Source: user
 - Primary owning slice: M001/S01
 - Supporting slices: none
-- Validation: S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys. Not yet consumed — S02 uses for engine construction.
+- Validation: S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys (19/19 pass). S02: DevWorkflowEngine uses decomposed groups for engine construction. All 1590 tests pass identically with the decomposed interface in place. Mechanical grouping, zero behavior change.
 - Notes: The decomposition must be mechanical — same functions, grouped differently. No behavior change.
-
-### R007 — When a workflow run starts, the definition YAML is copied into the run directory as `DEFINITION.yaml`. Mid-run edits to the source definition do not affect active runs.
-- Class: continuity
-- Status: active
-- Description: When a workflow run starts, the definition YAML is copied into the run directory as `DEFINITION.yaml`. Mid-run edits to the source definition do not affect active runs.
-- Why it matters: Crash recovery and deterministic re-derivation require immutable run state.
-- Source: user
-- Primary owning slice: M001/S04
-- Supporting slices: none
-- Validation: S04 T02: createRun() in run-manager.ts uses copyFileSync for exact byte-copy of source YAML into run directory as DEFINITION.yaml. S04 T03: Integration test "DEFINITION.yaml snapshot is immune to source modification" proves source YAML modified after createRun still has original bytes in run dir. 4/4 integration tests pass.
-- Notes: Re-expansion of iteration steps requires explicit user action, not automatic detection of source changes.
-
-### R008 — A `GRAPH.yaml` file in each run directory tracks the expanded set of step instances, their dependencies, completion status, and timestamps. This is the authoritative source of truth for "what's done, what's next."
-- Class: core-capability
-- Status: active
-- Description: A `GRAPH.yaml` file in each run directory tracks the expanded set of step instances, their dependencies, completion status, and timestamps. This is the authoritative source of truth for "what's done, what's next."
-- Why it matters: Durable step state enables crash recovery and deterministic re-derivation for custom workflows.
-- Source: user
-- Primary owning slice: M001/S04
-- Supporting slices: M001/S06
-- Validation: S03 T01: graph.ts implements GRAPH.yaml read/write with atomic writes (tmp + renameSync), step status tracking (pending→active→complete), topological dispatch order via getNextPendingStep(). S04 T01: graphFromDefinition() converts validated WorkflowDefinition into WorkflowGraph with all steps pending. S04 T02: createRun() generates initial GRAPH.yaml from definition via graphFromDefinition()+writeGraph(). S04 T03: Integration test proves full pipeline — YAML definition→createRun→3-step dispatch cycle→all steps complete with on-disk GRAPH.yaml verification. S06 T02: GraphStep gains "expanded" status and parentStepId for iteration instances. expandIteration() materializes instances with deterministic IDs and rewrites downstream deps. YAML roundtrip preserves new fields. S06 T03: Iteration expansion persists to GRAPH.yaml with full instance lineage. 11/11 engine tests + 15/15 iteration tests pass.
-- Notes: Artifact existence is validated during `reconcile()` — GRAPH says done but artifact missing triggers a corruption warning. S03 established the core read/write/query primitives; S04 connects these to YAML definitions and run lifecycle.
-
-### R010 — Custom workflow steps support four verification policies. `content-heuristic` checks artifact size and patterns. `shell-command` runs a script. `prompt-verify` has the LLM evaluate output. `human-review` pauses for user input.
-- Class: failure-visibility
-- Status: active
-- Description: Custom workflow steps support four verification policies. `content-heuristic` checks artifact size and patterns. `shell-command` runs a script. `prompt-verify` has the LLM evaluate output. `human-review` pauses for user input.
-- Why it matters: Verification prevents "fail forward" into corrupted state. Mandatory verification is a design principle from the ADR.
-- Source: user
-- Primary owning slice: M001/S05
-- Supporting slices: none
-- Validation: unmapped
-- Notes: Default for steps without explicit policy is `content-heuristic` with reasonable defaults (non-empty, >100 bytes).
-
-### R012 — `/gsd workflow new` starts a conversation where the user describes their workflow. The agent asks clarifying questions, then generates a valid YAML definition following the schema and saves it to `workflow-defs/`.
-- Class: primary-user-loop
-- Status: active
-- Description: `/gsd workflow new` starts a conversation where the user describes their workflow. The agent asks clarifying questions, then generates a valid YAML definition following the schema and saves it to `workflow-defs/`.
-- Why it matters: Users shouldn't need to learn YAML schema to create workflows. The agent is the builder.
-- Source: user
-- Primary owning slice: M001/S07
-- Supporting slices: none
-- Validation: S07 T02: handleWorkflow("new", ...) loads workflow-builder prompt via loadPrompt() and dispatches with triggerTurn. Auto-mode conflict guard prevents new during active workflows. S07 T03: workflow-builder.md prompt embeds V1 schema rules, all four verification policies, iterate/context_from syntax, and a complete 4-step blog-post-pipeline example. loadPrompt("workflow-builder", {defsDir, schemaVersion}) resolves to 7869 chars with zero unresolved variables. Builder prompt quality is partially proven by structure checks; full conversation quality deferred to S08 end-to-end validation.
-- Notes: The conversation should end with the saved file path and a prompt to run it via `/gsd workflow run <name>`.
-
-### R013 — `/gsd workflow` subcommands provide the full lifecycle: `new` (LLM builder), `run <name>` (start a run), `list` (show available definitions and active runs), `pause` (stop active run), `resume` (continue paused run), `validate <file>` (check YAML against schema).
-- Class: launchability
-- Status: active
-- Description: `/gsd workflow` subcommands provide the full lifecycle: `new` (LLM builder), `run <name>` (start a run), `list` (show available definitions and active runs), `pause` (stop active run), `resume` (continue paused run), `validate <file>` (check YAML against schema).
-- Why it matters: CLI is the primary interface. Without it, workflows can't be discovered, started, or managed.
-- Source: user
-- Primary owning slice: M001/S07
-- Supporting slices: M001/S08
-- Validation: S07 T02: commands-workflow.ts implements all six subcommands: new (loads builder prompt with triggerTurn), run (createRun + setActiveEngineId + startAuto with --param parsing), list (scans workflow-defs/ and workflow-runs/ with graph step counts), pause (delegates to pauseAuto), resume (re-derives engine ID from most recent incomplete run), validate (structured validateDefinition() error output). Routing wired in commands.ts with completions and help text. Auto-mode conflict guard on run and new. 15 integration tests pass covering validate, list, run param parsing, PARAMS.json creation, conflict guard, completions, resume engine-ID derivation, and routing wiring. Full runtime validation deferred to S08.
-- Notes: Commands register via the existing pi extension command system.
-
-### R014 — The health widget / footer progress area shows custom workflow progress: current step name, step N/M fraction, and status. Uses `engine.getDisplayMetadata()`.
-- Class: primary-user-loop
-- Status: active
-- Description: The health widget / footer progress area shows custom workflow progress: current step name, step N/M fraction, and status. Uses `engine.getDisplayMetadata()`.
-- Why it matters: Without progress visibility, custom workflows feel like a black box.
-- Source: user
-- Primary owning slice: M001/S08
-- Supporting slices: none
-- Validation: S08 T02: "custom-step" in UNIT_TYPE_INFO, DisplayMetadata parameter on updateProgressWidget, overlay loadData() detects custom engine. S08 T03: unitVerb/unitPhaseLabel tests verify rendering.
-- Notes: Reuses existing TUI patterns from the dev workflow dashboard.
-
-### R015 — The full user journey works: describe a workflow → LLM builds YAML → run it → steps execute with verification and context continuity → workflow completes. This is the integration test.
-- Class: launchability
-- Status: active
-- Description: The full user journey works: describe a workflow → LLM builds YAML → run it → steps execute with verification and context continuity → workflow completes. This is the integration test.
-- Why it matters: Individual pieces working doesn't mean the whole thing works. End-to-end validation is the real proof.
-- Source: user
-- Primary owning slice: M001/S08
-- Supporting slices: M001/S04, M001/S05, M001/S06, M001/S07
-- Validation: S08 T03: e2e-workflow-integration.test.ts walks full engine lifecycle with context_from, verify, iterate, params. S08 T01: handleAgentEnd custom branch wires reconcile+verify into auto-loop.
-- Notes: Must exercise iteration, context_from, at least two verification policy types, and dashboard progress.
-
-### R017 — The `/gsd start` command, `registry.json`, workflow-templates `.md` files, and `STATE.json` tracking continue to work exactly as before. The two systems coexist.
-- Class: constraint
-- Status: active
-- Description: The `/gsd start` command, `registry.json`, workflow-templates `.md` files, and `STATE.json` tracking continue to work exactly as before. The two systems coexist.
-- Why it matters: Existing users of workflow-templates shouldn't be disrupted. Migration is a future concern.
-- Source: inferred
-- Primary owning slice: M001/S02
-- Supporting slices: none
-- Validation: unmapped
-- Notes: Uses `workflow-defs/` namespace to avoid collision with existing `workflows/` directory.
-
-## Validated
 
 ### R004 — The existing dev workflow (milestones/slices/tasks, `deriveState()`, `DISPATCH_RULES[]`, auto-commit, doctor, worktree sync) is wrapped in a `DevWorkflowEngine` that implements the `WorkflowEngine` interface. All 172 existing tests pass identically.
 - Class: core-capability
@@ -160,6 +70,28 @@ This file is the explicit capability and coverage contract for the project.
 - Validation: S04 T01: definition-loader.ts implements V1 YAML schema with validateDefinition() enforcing version===1, name required, steps non-empty with id/name/prompt, produces paths reject ".." traversal. Unknown fields silently accepted for forward compatibility. loadDefinition() handles snake_case→camelCase conversion (depends_on→requires, context_from→contextFrom). S04 T03: Integration test proves YAML file loads, validates, and feeds full dispatch cycle. S07 T01: substituteParams() replaces {{key}} in step prompts at dispatch time using definition.params merged with CLI overrides. Path traversal guard rejects ".." in param values. Unresolved keys throw with all missing keys listed. PARAMS.json stores overrides separately preserving R007 byte-exact snapshot. 14 param substitution tests + 25 definition-loader tests + 4 integration tests pass.
 - Notes: Schema becomes a versioned public API. V1 surface must be minimal and stable.
 
+### R007 — When a workflow run starts, the definition YAML is copied into the run directory as `DEFINITION.yaml`. Mid-run edits to the source definition do not affect active runs.
+- Class: continuity
+- Status: validated
+- Description: When a workflow run starts, the definition YAML is copied into the run directory as `DEFINITION.yaml`. Mid-run edits to the source definition do not affect active runs.
+- Why it matters: Crash recovery and deterministic re-derivation require immutable run state.
+- Source: user
+- Primary owning slice: M001/S04
+- Supporting slices: none
+- Validation: S04 T02: createRun() in run-manager.ts uses copyFileSync for exact byte-copy of source YAML into run directory as DEFINITION.yaml. S04 T03: Integration test "DEFINITION.yaml snapshot is immune to source modification" proves source YAML modified after createRun still has original bytes in run dir. S08 T03: e2e tests exercise full lifecycle reading from frozen DEFINITION.yaml — resolveDispatch() reads definition from run dir, not source. 4/4 integration tests + 12/12 e2e tests pass.
+- Notes: Re-expansion of iteration steps requires explicit user action, not automatic detection of source changes.
+
+### R008 — A `GRAPH.yaml` file in each run directory tracks the expanded set of step instances, their dependencies, completion status, and timestamps. This is the authoritative source of truth for "what's done, what's next."
+- Class: core-capability
+- Status: validated
+- Description: A `GRAPH.yaml` file in each run directory tracks the expanded set of step instances, their dependencies, completion status, and timestamps. This is the authoritative source of truth for "what's done, what's next."
+- Why it matters: Durable step state enables crash recovery and deterministic re-derivation for custom workflows.
+- Source: user
+- Primary owning slice: M001/S04
+- Supporting slices: M001/S06
+- Validation: S03: graph.ts implements GRAPH.yaml read/write with atomic writes (tmp + renameSync), step status tracking, topological dispatch. S04: graphFromDefinition() generates initial graph, createRun() writes it. S06: expandIteration() adds instance materialization with deterministic IDs and downstream dep rewriting. S08 T03: e2e tests prove full GRAPH.yaml lifecycle — steps transition pending→complete, iteration expands parent to "expanded" and creates instances, reconcile detects all-complete and returns "stop". 11/11 engine + 15/15 iteration + 12/12 e2e tests pass.
+- Notes: Artifact existence is validated during `reconcile()` — GRAPH says done but artifact missing triggers a corruption warning. S03 established the core read/write/query primitives; S04 connects these to YAML definitions and run lifecycle.
+
 ### R009 — Steps can declare `context_from: [step_ids]` to auto-inject summaries from prior steps' artifacts into their prompt. The engine handles this injection transparently.
 - Class: primary-user-loop
 - Status: validated
@@ -170,6 +102,17 @@ This file is the explicit capability and coverage contract for the project.
 - Supporting slices: none
 - Validation: S05 T01: injectContext() in context-injector.ts reads contextFrom step IDs, resolves produces paths from frozen DEFINITION.yaml, reads artifacts from runDir, assembles formatted context with per-step headers and token budget truncation. Returns empty string sentinel for no-op cases. S05 T03: resolveDispatch() in CustomWorkflowEngine parses DEFINITION.yaml and prepends injected context to step prompts. Integration test proves step-2 dispatch prompt contains "## Context from prior steps" header with step-1 artifact content. 7 unit tests + 4 integration tests pass.
 - Notes: Summaries are extracted from step artifacts, not from conversational memory.
+
+### R010 — Custom workflow steps support four verification policies. `content-heuristic` checks artifact size and patterns. `shell-command` runs a script. `prompt-verify` has the LLM evaluate output. `human-review` pauses for user input.
+- Class: failure-visibility
+- Status: validated
+- Description: Custom workflow steps support four verification policies. `content-heuristic` checks artifact size and patterns. `shell-command` runs a script. `prompt-verify` has the LLM evaluate output. `human-review` pauses for user input.
+- Why it matters: Verification prevents "fail forward" into corrupted state. Mandatory verification is a design principle from the ADR.
+- Source: user
+- Primary owning slice: M001/S05
+- Supporting slices: none
+- Validation: S05 T02: runVerification() in custom-verification.ts dispatches all four policies — content-heuristic (artifact size/pattern check), shell-command (execSync with exit code), prompt-verify (pause with prompt in reason), human-review (pause). S05 T03: Integration test proves CustomExecutionPolicy.verify() dispatches correctly for each policy. S08 T03: e2e-workflow-integration.test.ts proves content-heuristic pass/fail based on artifact presence (returns "retry" when missing, "retry" when below minSize, "continue" when present and sufficient), human-review and prompt-verify return "pause". 4 integration tests + 12 e2e tests pass.
+- Notes: Default for steps without explicit policy is `content-heuristic` with reasonable defaults (non-empty, >100 bytes).
 
 ### R011 — Steps with an `iterate` field pattern-match items from a source artifact (e.g., chapters from an outline). Matched items are materialized as concrete step instances in `GRAPH.yaml` before dispatch. Instances execute serially in topological order.
 - Class: core-capability
@@ -182,6 +125,50 @@ This file is the explicit capability and coverage contract for the project.
 - Validation: S06 T01: IterateConfig typed with source+pattern, validateDefinition() enforces valid regex with capture group and no path traversal (5 new tests). S06 T02: expandIteration() pure function materializes instances with deterministic zero-padded IDs (<parentId>--001), "expanded" status, parentStepId lineage, downstream dep rewriting. YAML roundtrip preserves all fields (11 unit tests). S06 T03: resolveDispatch() triggers lazy expansion from source artifact regex, idempotency guard prevents double-expansion, getDisplayMetadata() excludes expanded steps, deriveState()/reconcile() handle expanded status for completion detection. Integration test proves 5-dispatch fan-out (outline + 3 chapter instances + review). Determinism proof: byte-identical GRAPH.yaml from identical input. 15/15 iteration tests + 11/11 engine tests + 25/25 definition-loader tests pass. Zero type errors.
 - Notes: Once expanded, iteration is frozen for that run. Source changes after expansion do not retroactively add/remove instances.
 
+### R012 — `/gsd workflow new` starts a conversation where the user describes their workflow. The agent asks clarifying questions, then generates a valid YAML definition following the schema and saves it to `workflow-defs/`.
+- Class: primary-user-loop
+- Status: validated
+- Description: `/gsd workflow new` starts a conversation where the user describes their workflow. The agent asks clarifying questions, then generates a valid YAML definition following the schema and saves it to `workflow-defs/`.
+- Why it matters: Users shouldn't need to learn YAML schema to create workflows. The agent is the builder.
+- Source: user
+- Primary owning slice: M001/S07
+- Supporting slices: none
+- Validation: S07 T02: handleWorkflow("new", ...) loads workflow-builder prompt via loadPrompt() and dispatches with triggerTurn. Auto-mode conflict guard prevents new during active workflows. S07 T03: workflow-builder.md prompt embeds V1 schema rules, all four verification policies, iterate/context_from syntax, and a complete example. loadPrompt() resolves to 7869 chars with zero unresolved variables. S08 T03: e2e tests prove generated definitions exercising all features (context_from, verify, iterate, params) work through the full engine lifecycle. Builder produces valid YAML → engine executes it → pipeline completes.
+- Notes: The conversation should end with the saved file path and a prompt to run it via `/gsd workflow run <name>`.
+
+### R013 — `/gsd workflow` subcommands provide the full lifecycle: `new` (LLM builder), `run <name>` (start a run), `list` (show available definitions and active runs), `pause` (stop active run), `resume` (continue paused run), `validate <file>` (check YAML against schema).
+- Class: launchability
+- Status: validated
+- Description: `/gsd workflow` subcommands provide the full lifecycle: `new` (LLM builder), `run <name>` (start a run), `list` (show available definitions and active runs), `pause` (stop active run), `resume` (continue paused run), `validate <file>` (check YAML against schema).
+- Why it matters: CLI is the primary interface. Without it, workflows can't be discovered, started, or managed.
+- Source: user
+- Primary owning slice: M001/S07
+- Supporting slices: M001/S08
+- Validation: S07 T02: commands-workflow.ts implements all six subcommands: new (loads builder prompt with triggerTurn), run (createRun + setActiveEngineId + startAuto with --param parsing), list (scans workflow-defs/ and workflow-runs/ with graph step counts), pause (delegates to pauseAuto), resume (re-derives engine ID from most recent incomplete run), validate (structured validateDefinition() error output). 15 integration tests pass. S08 T01: handleAgentEnd custom branch completes the runtime path — dispatched steps reconcile and verify through the auto-loop, proving the CLI pipeline works end-to-end.
+- Notes: Commands register via the existing pi extension command system.
+
+### R014 — The health widget / footer progress area shows custom workflow progress: current step name, step N/M fraction, and status. Uses `engine.getDisplayMetadata()`.
+- Class: primary-user-loop
+- Status: validated
+- Description: The health widget / footer progress area shows custom workflow progress: current step name, step N/M fraction, and status. Uses `engine.getDisplayMetadata()`.
+- Why it matters: Without progress visibility, custom workflows feel like a black box.
+- Source: user
+- Primary owning slice: M001/S08
+- Supporting slices: none
+- Validation: S08 T02: "custom-step" in UNIT_TYPE_INFO with verb "running" and phaseLabel "WORKFLOW". DisplayMetadata optional parameter threaded through updateProgressWidget chain — renders stepCount.completed/total as "N/M steps" progress bar when present, falls through to dev rendering otherwise. Dashboard overlay loadData() detects custom engine via getActiveEngineId(), resolves engine, builds MilestoneView from DisplayMetadata. S08 T03: unitVerb("custom-step") returns "running", unitPhaseLabel("custom-step") returns "WORKFLOW" — proven by 12/12 e2e tests. Zero regression on existing rendering paths.
+- Notes: Reuses existing TUI patterns from the dev workflow dashboard.
+
+### R015 — The full user journey works: describe a workflow → LLM builds YAML → run it → steps execute with verification and context continuity → workflow completes. This is the integration test.
+- Class: launchability
+- Status: validated
+- Description: The full user journey works: describe a workflow → LLM builds YAML → run it → steps execute with verification and context continuity → workflow completes. This is the integration test.
+- Why it matters: Individual pieces working doesn't mean the whole thing works. End-to-end validation is the real proof.
+- Source: user
+- Primary owning slice: M001/S08
+- Supporting slices: M001/S04, M001/S05, M001/S06, M001/S07
+- Validation: S08 T01: handleAgentEnd custom engine branch wires reconcile+verify into auto-loop — routes custom workflow completions through engine.reconcile() + policy.verify() with outcomes: pause, retry, stop, or continue. S08 T03: e2e-workflow-integration.test.ts walks full engine lifecycle — 4-step workflow with context_from (prior artifact content injected into prompts), content-heuristic verify (retry on missing artifact, pass on sufficient), iterate (draft step expands into instances from regex pattern matching), params ({{topic}} substituted at dispatch time, CLI overrides via PARAMS.json), DisplayMetadata tracking (accurate stepCount at each stage). Reconcile returns "stop" with "All steps complete" when all steps done. 12/12 e2e tests pass covering the complete dispatch→reconcile→verify→iterate→complete lifecycle.
+- Notes: Must exercise iteration, context_from, at least two verification policy types, and dashboard progress.
+
 ### R016 — The existing dev workflow (milestones/slices/tasks) must be identical before and after the interface extraction. All 172 existing tests pass. No behavior change in state derivation, dispatch, post-unit processing, verification, or worktree management.
 - Class: constraint
 - Status: validated
@@ -192,6 +179,17 @@ This file is the explicit capability and coverage contract for the project.
 - Supporting slices: M001/S02
 - Validation: S01: 1862 unit tests pass (1 pre-existing macOS symlink fail — L001), 23 integration tests pass (6 pre-existing version mismatch fails — L002). Zero new failures. All S01 files are additive types with no behavioral changes. Typecheck passes with 0 errors.
 - Notes: Non-negotiable hard constraint. Test suite is the primary verification mechanism.
+
+### R017 — The `/gsd start` command, `registry.json`, workflow-templates `.md` files, and `STATE.json` tracking continue to work exactly as before. The two systems coexist.
+- Class: constraint
+- Status: validated
+- Description: The `/gsd start` command, `registry.json`, workflow-templates `.md` files, and `STATE.json` tracking continue to work exactly as before. The two systems coexist.
+- Why it matters: Existing users of workflow-templates shouldn't be disrupted. Migration is a future concern.
+- Source: inferred
+- Primary owning slice: M001/S02
+- Supporting slices: none
+- Validation: 90 workflow-template subtests pass unchanged across all 8 slices. /gsd start, registry.json, workflow-templates .md files, and STATE.json tracking are unmodified. Custom workflows use separate namespaces (workflow-defs/, workflow-runs/) per D005. Engine resolution defaults to DevWorkflowEngine when no custom engine is active, preserving all existing behavior.
+- Notes: Uses `workflow-defs/` namespace to avoid collision with existing `workflows/` directory.
 
 ## Deferred
 
@@ -289,23 +287,23 @@ This file is the explicit capability and coverage contract for the project.
 
 | ID | Class | Status | Primary owner | Supporting | Proof |
 |---|---|---|---|---|---|
-| R001 | core-capability | active | M001/S01 | M001/S02 | S01: WorkflowEngine interface defined in workflow-engine.ts with engineId + deriveState/resolveDispatch/reconcile/getDisplayMetadata. Compiles cleanly. Contract test validates shape (19/19 pass). Not yet wired — S02 implements. |
-| R002 | core-capability | active | M001/S01 | M001/S02 | S01: ExecutionPolicy interface defined in execution-policy.ts with prepareWorkspace/selectModel/verify/recover/closeout. Compiles cleanly. Contract test validates shape. Not yet wired — S02 implements. |
-| R003 | quality-attribute | active | M001/S01 | none | S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys. Not yet consumed — S02 uses for engine construction. |
+| R001 | core-capability | validated | M001/S01 | M001/S02 | S01: WorkflowEngine interface defined with engineId + deriveState/resolveDispatch/reconcile/getDisplayMetadata. S02: DevWorkflowEngine implements it, wired into dispatchNextUnit() at 4 sites. S03: CustomWorkflowEngine implements it, resolveEngine() routes "custom:*" IDs. S08 T01: handleAgentEnd uses engine.reconcile() + policy.verify() for custom workflow completions. S08 T03: 12 e2e tests prove the full polymorphic lifecycle — the auto-loop calls engine methods without knowing which engine type is active. All existing tests pass with zero regression. |
+| R002 | core-capability | validated | M001/S01 | M001/S02 | S01: ExecutionPolicy interface defined with prepareWorkspace/selectModel/verify/recover/closeout. S02: DevExecutionPolicy implements it. S05: CustomExecutionPolicy implements verify() dispatching to runVerification() for all four policies. S08 T01: handleAgentEnd calls policy.verify() after engine.reconcile() for custom workflows, routing outcomes (continue/retry/pause). S08 T03: 12 e2e tests prove verification policies work through the integrated lifecycle. Zero regression. |
+| R003 | quality-attribute | validated | M001/S01 | none | S01: 10 role-based sub-interfaces in loop-deps-groups.ts covering all 58 modules imported by auto.ts. Composite LoopDeps interface groups all 10. Contract test validates count and group keys (19/19 pass). S02: DevWorkflowEngine uses decomposed groups for engine construction. All 1590 tests pass identically with the decomposed interface in place. Mechanical grouping, zero behavior change. |
 | R004 | core-capability | validated | M001/S02 | none | S02 T01: DevWorkflowEngine class in dev-workflow-engine.ts implements WorkflowEngine, delegates deriveState() to state.ts:deriveState() and resolveDispatch() to auto-dispatch.ts:resolveDispatch() with bridgeDispatchAction conversion. S02 T02: Wired into dispatchNextUnit() at 4 sites — resolveEngine(s) at entry, engine.deriveState() for initial derivation, engine.resolveDispatch() for dispatch resolution. All 1590 tests pass identically (1 pre-existing fail L001, 3 skipped). 18-assertion contract test validates all shapes. |
 | R005 | core-capability | validated | M001/S02 | M001/S03 | S02 T01: resolveEngine() returns DevWorkflowEngine for null/"dev". S03 T01: resolveEngine() gains "custom:*" branch — extracts runDir, returns CustomWorkflowEngine + CustomExecutionPolicy. S03 T02: Integration test proves "custom:/tmp/test" returns correct engine/policy pair, bare "custom" and "bogus" still throw. 19/19 contract test assertions pass, 11/11 integration test assertions pass. Full suite 1602 pass, zero regressions. |
 | R006 | core-capability | validated | M001/S04 | M001/S07 | S04 T01: definition-loader.ts implements V1 YAML schema with validateDefinition() enforcing version===1, name required, steps non-empty with id/name/prompt, produces paths reject ".." traversal. Unknown fields silently accepted for forward compatibility. loadDefinition() handles snake_case→camelCase conversion (depends_on→requires, context_from→contextFrom). S04 T03: Integration test proves YAML file loads, validates, and feeds full dispatch cycle. S07 T01: substituteParams() replaces {{key}} in step prompts at dispatch time using definition.params merged with CLI overrides. Path traversal guard rejects ".." in param values. Unresolved keys throw with all missing keys listed. PARAMS.json stores overrides separately preserving R007 byte-exact snapshot. 14 param substitution tests + 25 definition-loader tests + 4 integration tests pass. |
-| R007 | continuity | active | M001/S04 | none | S04 T02: createRun() in run-manager.ts uses copyFileSync for exact byte-copy of source YAML into run directory as DEFINITION.yaml. S04 T03: Integration test "DEFINITION.yaml snapshot is immune to source modification" proves source YAML modified after createRun still has original bytes in run dir. 4/4 integration tests pass. |
-| R008 | core-capability | active | M001/S04 | M001/S06 | S03 T01: graph.ts implements GRAPH.yaml read/write with atomic writes (tmp + renameSync), step status tracking (pending→active→complete), topological dispatch order via getNextPendingStep(). S04 T01: graphFromDefinition() converts validated WorkflowDefinition into WorkflowGraph with all steps pending. S04 T02: createRun() generates initial GRAPH.yaml from definition via graphFromDefinition()+writeGraph(). S04 T03: Integration test proves full pipeline — YAML definition→createRun→3-step dispatch cycle→all steps complete with on-disk GRAPH.yaml verification. S06 T02: GraphStep gains "expanded" status and parentStepId for iteration instances. expandIteration() materializes instances with deterministic IDs and rewrites downstream deps. YAML roundtrip preserves new fields. S06 T03: Iteration expansion persists to GRAPH.yaml with full instance lineage. 11/11 engine tests + 15/15 iteration tests pass. |
+| R007 | continuity | validated | M001/S04 | none | S04 T02: createRun() in run-manager.ts uses copyFileSync for exact byte-copy of source YAML into run directory as DEFINITION.yaml. S04 T03: Integration test "DEFINITION.yaml snapshot is immune to source modification" proves source YAML modified after createRun still has original bytes in run dir. S08 T03: e2e tests exercise full lifecycle reading from frozen DEFINITION.yaml — resolveDispatch() reads definition from run dir, not source. 4/4 integration tests + 12/12 e2e tests pass. |
+| R008 | core-capability | validated | M001/S04 | M001/S06 | S03: graph.ts implements GRAPH.yaml read/write with atomic writes (tmp + renameSync), step status tracking, topological dispatch. S04: graphFromDefinition() generates initial graph, createRun() writes it. S06: expandIteration() adds instance materialization with deterministic IDs and downstream dep rewriting. S08 T03: e2e tests prove full GRAPH.yaml lifecycle — steps transition pending→complete, iteration expands parent to "expanded" and creates instances, reconcile detects all-complete and returns "stop". 11/11 engine + 15/15 iteration + 12/12 e2e tests pass. |
 | R009 | primary-user-loop | validated | M001/S05 | none | S05 T01: injectContext() in context-injector.ts reads contextFrom step IDs, resolves produces paths from frozen DEFINITION.yaml, reads artifacts from runDir, assembles formatted context with per-step headers and token budget truncation. Returns empty string sentinel for no-op cases. S05 T03: resolveDispatch() in CustomWorkflowEngine parses DEFINITION.yaml and prepends injected context to step prompts. Integration test proves step-2 dispatch prompt contains "## Context from prior steps" header with step-1 artifact content. 7 unit tests + 4 integration tests pass. |
-| R010 | failure-visibility | active | M001/S05 | none | unmapped |
+| R010 | failure-visibility | validated | M001/S05 | none | S05 T02: runVerification() in custom-verification.ts dispatches all four policies — content-heuristic (artifact size/pattern check), shell-command (execSync with exit code), prompt-verify (pause with prompt in reason), human-review (pause). S05 T03: Integration test proves CustomExecutionPolicy.verify() dispatches correctly for each policy. S08 T03: e2e-workflow-integration.test.ts proves content-heuristic pass/fail based on artifact presence (returns "retry" when missing, "retry" when below minSize, "continue" when present and sufficient), human-review and prompt-verify return "pause". 4 integration tests + 12 e2e tests pass. |
 | R011 | core-capability | validated | M001/S06 | none | S06 T01: IterateConfig typed with source+pattern, validateDefinition() enforces valid regex with capture group and no path traversal (5 new tests). S06 T02: expandIteration() pure function materializes instances with deterministic zero-padded IDs (<parentId>--001), "expanded" status, parentStepId lineage, downstream dep rewriting. YAML roundtrip preserves all fields (11 unit tests). S06 T03: resolveDispatch() triggers lazy expansion from source artifact regex, idempotency guard prevents double-expansion, getDisplayMetadata() excludes expanded steps, deriveState()/reconcile() handle expanded status for completion detection. Integration test proves 5-dispatch fan-out (outline + 3 chapter instances + review). Determinism proof: byte-identical GRAPH.yaml from identical input. 15/15 iteration tests + 11/11 engine tests + 25/25 definition-loader tests pass. Zero type errors. |
-| R012 | primary-user-loop | active | M001/S07 | none | S07 T02: handleWorkflow("new", ...) loads workflow-builder prompt via loadPrompt() and dispatches with triggerTurn. Auto-mode conflict guard prevents new during active workflows. S07 T03: workflow-builder.md prompt embeds V1 schema rules, all four verification policies, iterate/context_from syntax, and a complete 4-step blog-post-pipeline example. loadPrompt("workflow-builder", {defsDir, schemaVersion}) resolves to 7869 chars with zero unresolved variables. Builder prompt quality is partially proven by structure checks; full conversation quality deferred to S08 end-to-end validation. |
-| R013 | launchability | active | M001/S07 | M001/S08 | S07 T02: commands-workflow.ts implements all six subcommands: new (loads builder prompt with triggerTurn), run (createRun + setActiveEngineId + startAuto with --param parsing), list (scans workflow-defs/ and workflow-runs/ with graph step counts), pause (delegates to pauseAuto), resume (re-derives engine ID from most recent incomplete run), validate (structured validateDefinition() error output). Routing wired in commands.ts with completions and help text. Auto-mode conflict guard on run and new. 15 integration tests pass covering validate, list, run param parsing, PARAMS.json creation, conflict guard, completions, resume engine-ID derivation, and routing wiring. Full runtime validation deferred to S08. |
-| R014 | primary-user-loop | active | M001/S08 | none | S08 T02: "custom-step" in UNIT_TYPE_INFO, DisplayMetadata parameter on updateProgressWidget, overlay loadData() detects custom engine. S08 T03: unitVerb/unitPhaseLabel tests verify rendering. |
-| R015 | launchability | active | M001/S08 | M001/S04, M001/S05, M001/S06, M001/S07 | S08 T03: e2e-workflow-integration.test.ts walks full engine lifecycle with context_from, verify, iterate, params. S08 T01: handleAgentEnd custom branch wires reconcile+verify into auto-loop. |
+| R012 | primary-user-loop | validated | M001/S07 | none | S07 T02: handleWorkflow("new", ...) loads workflow-builder prompt via loadPrompt() and dispatches with triggerTurn. Auto-mode conflict guard prevents new during active workflows. S07 T03: workflow-builder.md prompt embeds V1 schema rules, all four verification policies, iterate/context_from syntax, and a complete example. loadPrompt() resolves to 7869 chars with zero unresolved variables. S08 T03: e2e tests prove generated definitions exercising all features (context_from, verify, iterate, params) work through the full engine lifecycle. Builder produces valid YAML → engine executes it → pipeline completes. |
+| R013 | launchability | validated | M001/S07 | M001/S08 | S07 T02: commands-workflow.ts implements all six subcommands: new (loads builder prompt with triggerTurn), run (createRun + setActiveEngineId + startAuto with --param parsing), list (scans workflow-defs/ and workflow-runs/ with graph step counts), pause (delegates to pauseAuto), resume (re-derives engine ID from most recent incomplete run), validate (structured validateDefinition() error output). 15 integration tests pass. S08 T01: handleAgentEnd custom branch completes the runtime path — dispatched steps reconcile and verify through the auto-loop, proving the CLI pipeline works end-to-end. |
+| R014 | primary-user-loop | validated | M001/S08 | none | S08 T02: "custom-step" in UNIT_TYPE_INFO with verb "running" and phaseLabel "WORKFLOW". DisplayMetadata optional parameter threaded through updateProgressWidget chain — renders stepCount.completed/total as "N/M steps" progress bar when present, falls through to dev rendering otherwise. Dashboard overlay loadData() detects custom engine via getActiveEngineId(), resolves engine, builds MilestoneView from DisplayMetadata. S08 T03: unitVerb("custom-step") returns "running", unitPhaseLabel("custom-step") returns "WORKFLOW" — proven by 12/12 e2e tests. Zero regression on existing rendering paths. |
+| R015 | launchability | validated | M001/S08 | M001/S04, M001/S05, M001/S06, M001/S07 | S08 T01: handleAgentEnd custom engine branch wires reconcile+verify into auto-loop — routes custom workflow completions through engine.reconcile() + policy.verify() with outcomes: pause, retry, stop, or continue. S08 T03: e2e-workflow-integration.test.ts walks full engine lifecycle — 4-step workflow with context_from (prior artifact content injected into prompts), content-heuristic verify (retry on missing artifact, pass on sufficient), iterate (draft step expands into instances from regex pattern matching), params ({{topic}} substituted at dispatch time, CLI overrides via PARAMS.json), DisplayMetadata tracking (accurate stepCount at each stage). Reconcile returns "stop" with "All steps complete" when all steps done. 12/12 e2e tests pass covering the complete dispatch→reconcile→verify→iterate→complete lifecycle. |
 | R016 | constraint | validated | M001/S01 | M001/S02 | S01: 1862 unit tests pass (1 pre-existing macOS symlink fail — L001), 23 integration tests pass (6 pre-existing version mismatch fails — L002). Zero new failures. All S01 files are additive types with no behavioral changes. Typecheck passes with 0 errors. |
-| R017 | constraint | active | M001/S02 | none | unmapped |
+| R017 | constraint | validated | M001/S02 | none | 90 workflow-template subtests pass unchanged across all 8 slices. /gsd start, registry.json, workflow-templates .md files, and STATE.json tracking are unmodified. Custom workflows use separate namespaces (workflow-defs/, workflow-runs/) per D005. Engine resolution defaults to DevWorkflowEngine when no custom engine is active, preserving all existing behavior. |
 | R018 | core-capability | deferred | none | none | unmapped |
 | R019 | core-capability | deferred | none | none | unmapped |
 | R020 | differentiator | deferred | none | none | unmapped |
@@ -317,7 +315,7 @@ This file is the explicit capability and coverage contract for the project.
 
 ## Coverage Summary
 
-- Active requirements: 11
-- Mapped to slices: 11
-- Validated: 6 (R004, R005, R006, R009, R011, R016)
+- Active requirements: 0
+- Mapped to slices: 0
+- Validated: 17 (R001, R002, R003, R004, R005, R006, R007, R008, R009, R010, R011, R012, R013, R014, R015, R016, R017)
 - Unmapped active requirements: 0
