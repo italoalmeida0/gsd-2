@@ -599,7 +599,6 @@ export async function handleGSDCommand(
           await handleDryRun(ctx, projectRoot());
           return;
         }
-        if (notifyRemoteAutoActive(ctx, projectRoot())) return;
         const verboseMode = trimmed.includes("--verbose");
         const debugMode = trimmed.includes("--debug");
         if (debugMode) enableDebug(projectRoot());
