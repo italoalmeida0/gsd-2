@@ -2,99 +2,113 @@
 
 ## Overview
 
-GSD 2 uses a three-stage promotion pipeline that automatically moves merged PRs through **Dev → Test → Prod** environments using npm dist-tags.
+GSD uses a simple CI/CD setup: required PR checks for merge safety, and an explicit release workflow for publishing.
 
 ```
-PR merged to main
+Contributors open PRs
         │
         ▼
-   ┌─────────┐    ci.yml passes (build, test, typecheck)
-   │   DEV   │    → publishes gsd-pi@<version>-dev.<sha> with @dev tag
-   └────┬────┘
-        ▼ (automatic if green)
-   ┌─────────┐    CLI smoke tests + LLM fixture replay
-   │  TEST   │    → promotes to @next tag
-   └────┬────┘    → pushes Docker image as :next
-        ▼ (manual approval required)
-   ┌─────────┐    optional real-LLM integration tests
-   │  PROD   │    → promotes to @latest tag
-   └─────────┘    → creates GitHub Release
+   ┌──────────┐    checks.yml: build, test, typecheck, security scan
+   │  CHECKS  │    required for merge — runs on every PR and push to main
+   └────┬─────┘
+        ▼
+   Maintainer squash-merges when ready
+        │
+        ▼ (explicit workflow_dispatch)
+   ┌──────────┐    release.yml: build, smoke test, publish, tag, GitHub Release
+   │ RELEASE  │    one workflow owns all stable publishing
+   └──────────┘
 ```
 
-## For Contributors: Testing Your PR Before It Ships
+Releases are explicit maintainer decisions, not side effects of merging code. You can merge ten PRs and ship once when ready.
 
-### Install the Dev Build
+## For Contributors
 
-Every merged PR is immediately installable:
+### Checking CI Status
+
+Every PR runs `checks.yml` automatically. All jobs must pass before merge:
+
+- Secret scan
+- `.gsd/` directory guard
+- Skill reference validation
+- Linux: build, typecheck, unit tests, integration tests, package validation
+- Windows: build, typecheck, unit tests
+
+### Installing a Release
 
 ```bash
-# Latest dev build (bleeding edge, every merged PR)
-npx gsd-pi@dev
-
-# Test candidate (passed smoke + fixture tests)
-npx gsd-pi@next
-
 # Stable production release
 npx gsd-pi@latest    # or just: npx gsd-pi
+
+# Specific version
+npx gsd-pi@2.37.0
 ```
 
 ### Using Docker
 
 ```bash
-# Test candidate
-docker run --rm -v $(pwd):/workspace ghcr.io/gsd-build/gsd-pi:next --version
-
-# Stable
+# Latest stable
 docker run --rm -v $(pwd):/workspace ghcr.io/gsd-build/gsd-pi:latest --version
+
+# Specific version
+docker run --rm -v $(pwd):/workspace ghcr.io/gsd-build/gsd-pi:2.37.0 --version
 ```
-
-### Checking if a Fix Landed
-
-1. Find the PR's merge commit SHA (first 7 chars)
-2. Check if it's in `@dev`: `npm view gsd-pi@dev version`
-   - If the version ends in `-dev.<your-sha>`, your PR is in dev
-3. Check if it promoted to `@next`: `npm view gsd-pi@next version`
-4. Check if it's in production: `npm view gsd-pi@latest version`
 
 ## For Maintainers
 
-### Pipeline Workflows
+### Workflows
 
-| Workflow | File | Trigger | Purpose |
-|----------|------|---------|---------|
-| CI | `ci.yml` | PR + push to main | Build, test, typecheck — **gate for all promotions** |
-| Release Pipeline | `pipeline.yml` | After CI succeeds on main | Three-stage promotion |
-| Native Binaries | `build-native.yml` | `v*` tags | Cross-compile platform binaries |
-| Dev Cleanup | `cleanup-dev-versions.yml` | Weekly (Monday 06:00 UTC) | Unpublish `-dev.` versions older than 30 days |
+| Workflow | File | Trigger | Required for merge |
+|----------|------|---------|--------------------|
+| Checks | `checks.yml` | `pull_request` + `push` to `main` | **Yes** |
+| Release | `release.yml` | `workflow_dispatch` (manual) | No |
+| Build Native | `build-native.yml` | `v*` tags + manual dispatch | No |
+| Builder Image | `builder-image.yml` | Push to `main` (path-filtered) | No |
+| AI Triage | `ai-triage.yml` | Issue/PR opened | No |
 
-### Gating Tests
+### Day-to-Day Loop
 
-The pipeline only triggers after `ci.yml` passes. Key gating tests include:
+1. Contributors open PRs against `main`.
+2. `checks.yml` runs and gives the merge decision.
+3. Squash-merge PRs when checks are green and the change is ready.
+4. When you want to ship, go to Actions → Release → Run workflow.
+5. Choose the bump type (`auto` detects from conventional commits, or override with `patch`/`minor`/`major`).
+6. The release workflow builds, tests, publishes to npm, creates a GitHub Release, pushes Docker images, and posts to Discord.
 
-- **Unit tests** (`npm run test:unit`) — includes `auto-session-encapsulation.test.ts` which enforces that all auto-mode state is encapsulated in `AutoSession`, plus dispatch loop regression tests that exercise the full `deriveState → resolveDispatch → idempotency` chain without an LLM. Any PR adding module-level mutable state to `auto.ts` will fail CI and block the pipeline.
-- **Integration tests** (`npm run test:integration`)
-- **Extension typecheck** (`npm run typecheck:extensions`)
-- **Package validation** (`npm run validate-pack`)
-- **Smoke tests** (`npm run test:smoke`) — run post-build in the pipeline against the local binary and again against the globally-installed `@dev` package
-- **Fixture tests** (`npm run test:fixtures`) — replay recorded LLM conversations without hitting real APIs
-- **Live regression tests** (`npm run test:live-regression`) — run against the installed binary in the Test stage to catch runtime regressions before promotion to `@next`
+### Releasing
 
-### Approving a Prod Release
+Go to **Actions → Release → Run workflow** and choose:
 
-1. A version reaches the Test stage automatically
-2. In GitHub Actions, the `prod-release` job will show "Waiting for review"
-3. Click **Review deployments** → select `prod` → **Approve**
-4. The version is promoted to `@latest` and a GitHub Release is created
+- **bump**: `auto` (recommended) lets `generate-changelog.mjs` determine the bump type from conventional commits. Override with `patch`, `minor`, or `major` if needed.
+- **dry-run**: `true` to run the full build and test pipeline without publishing or pushing. Use this to verify a release will succeed before committing to it.
 
-To enable live LLM tests during Prod promotion:
-- Set the `RUN_LIVE_TESTS` environment variable to `true` on the `prod` environment
+The release workflow:
+1. Generates changelog from conventional commits since the last stable tag
+2. Bumps version in all package.json files
+3. Updates CHANGELOG.md
+4. Builds and runs smoke tests
+5. Commits with `[skip ci]` to prevent re-triggering checks
+6. Tags and pushes
+7. Publishes to npm with `--provenance`
+8. Creates GitHub Release
+9. Builds and pushes Docker runtime image
+10. Posts to Discord (if webhook is configured)
+
+### Native Binaries
+
+`build-native.yml` triggers on `v*` tags (created by the release workflow) and publishes platform-specific `@gsd-build/engine-*` packages. It does **not** publish the main `gsd-pi` package — that's exclusively owned by `release.yml`.
+
+The native binary matrix covers:
+- `darwin-arm64` (Apple Silicon)
+- `darwin-x64` (Intel Mac)
+- `linux-x64-gnu`
+- `linux-arm64-gnu`
+- `win32-x64-msvc`
 
 ### Rolling Back a Release
 
-If a broken version reaches production:
-
 ```bash
-# Roll back npm
+# Roll back npm to a previous version
 npm dist-tag add gsd-pi@<previous-good-version> latest
 
 # Roll back Docker
@@ -103,29 +117,35 @@ docker tag ghcr.io/gsd-build/gsd-pi:<previous-good-version> ghcr.io/gsd-build/gs
 docker push ghcr.io/gsd-build/gsd-pi:latest
 ```
 
-For `@dev` or `@next` rollbacks, the next successful merge will overwrite the tag automatically.
-
 ### GitHub Configuration Required
 
 | Setting | Value |
 |---------|-------|
-| Environment: `dev` | No protection rules |
-| Environment: `test` | No protection rules |
+| Required status check | `Checks` workflow (all jobs) |
 | Environment: `prod` | Required reviewers: maintainers |
-| Secret: `NPM_TOKEN` | All environments |
-| Secret: `ANTHROPIC_API_KEY` | Prod environment only |
-| Secret: `OPENAI_API_KEY` | Prod environment only |
-| Variable: `RUN_LIVE_TESTS` | `false` (set to `true` to enable live LLM tests) |
+| Secret: `NPM_TOKEN` | `prod` environment |
+| Secret: `RELEASE_PAT` | `prod` environment (PAT with `contents: write` for pushing release commits) |
+| Secret: `ANTHROPIC_API_KEY` | `prod` environment (for AI triage) |
+| Secret: `DISCORD_CHANGELOG_WEBHOOK` | `prod` environment (optional) |
 | GHCR | Enabled for the `gsd-build` org |
+
+### Branch Protection
+
+Recommended settings:
+
+- Squash merge only
+- Require `Checks` workflow to pass
+- Require conversation resolution before merge
+- Require branch to be up to date before merge (optional — enable if merge conflicts are frequent)
 
 ### Docker Images
 
 | Image | Base | Purpose | Tags |
 |-------|------|---------|------|
-| `ghcr.io/gsd-build/gsd-ci-builder` | `node:24-bookworm` | CI build environment with Rust toolchain | `:latest`, `:<date>` |
-| `ghcr.io/gsd-build/gsd-pi` | `node:24-slim` | User-facing runtime | `:latest`, `:next`, `:v<version>` |
+| `ghcr.io/gsd-build/gsd-ci-builder` | `node:24-bookworm` | CI build environment with Rust toolchain | `:latest` |
+| `ghcr.io/gsd-build/gsd-pi` | `node:24-slim` | User-facing runtime | `:latest`, `:<version>` |
 
-The CI builder image is rebuilt automatically when the `Dockerfile` changes. It eliminates ~3-5 min of toolchain setup per CI run.
+The builder image is rebuilt automatically only when `Dockerfile` changes (path-triggered workflow).
 
 ## LLM Fixture Tests
 
@@ -140,12 +160,11 @@ npm run test:fixtures
 ### Recording New Fixtures
 
 ```bash
-# Set your API key, then record
 GSD_FIXTURE_MODE=record GSD_FIXTURE_DIR=./tests/fixtures/recordings \
   node --experimental-strip-types tests/fixtures/record.ts
 ```
 
-Fixtures are JSON files in `tests/fixtures/recordings/`. Each one captures a conversation's request/response pairs and replays them by turn index.
+Fixtures are JSON files in `tests/fixtures/recordings/`. Each captures a conversation's request/response pairs and replays them by turn index.
 
 ### When to Re-Record
 
@@ -153,13 +172,3 @@ Re-record fixtures when:
 - Provider wire format changes (e.g., new field in Anthropic response)
 - Tool definitions change (affects request shape)
 - System prompt changes (may cause turn count mismatch)
-
-## Version Strategy
-
-| Tag | Published | Format | Who uses it |
-|-----|-----------|--------|-------------|
-| `@dev` | Every merged PR | `2.27.0-dev.a3f2c1b` | Developers verifying fixes |
-| `@next` | Auto-promoted from dev | Same version | Early adopters, beta testers |
-| `@latest` | Manually approved | Same version | Production users |
-
-Old `-dev.` versions are cleaned up weekly (30-day retention).

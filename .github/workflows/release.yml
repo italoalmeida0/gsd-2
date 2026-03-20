@@ -1,0 +1,182 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+        default: auto
+      dry-run:
+        description: 'Dry run (skip publish and push)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Build & Publish
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate changelog and determine version
+        id: changelog
+        run: |
+          OUTPUT=$(node scripts/generate-changelog.mjs)
+          echo "$OUTPUT" | jq .
+
+          AUTO_BUMP=$(echo "$OUTPUT" | jq -r '.bumpType')
+          AUTO_VERSION=$(echo "$OUTPUT" | jq -r '.newVersion')
+
+          # If bump type is not 'auto', recompute the version
+          if [ "${{ inputs.bump }}" != "auto" ]; then
+            CURRENT=$(node -p "require('./package.json').version.replace(/-.*$/, '')")
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
+              minor) NEW_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+              patch) NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            esac
+            echo "Override: auto=$AUTO_VERSION → manual=$NEW_VERSION"
+          else
+            NEW_VERSION="$AUTO_VERSION"
+          fi
+
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "$OUTPUT" | jq -r '.changelogEntry' > /tmp/changelog-entry.md
+          echo "$OUTPUT" | jq -r '.releaseNotes' > /tmp/release-notes.md
+
+          # If we overrode the version, patch the changelog entry header
+          if [ "$NEW_VERSION" != "$AUTO_VERSION" ]; then
+            sed -i "s/## \[${AUTO_VERSION}\]/## [${NEW_VERSION}]/" /tmp/changelog-entry.md
+          fi
+
+      - name: Bump version and sync packages
+        run: node scripts/bump-version.mjs "${{ steps.changelog.outputs.version }}"
+
+      - name: Update CHANGELOG.md
+        run: node scripts/update-changelog.mjs /tmp/changelog-entry.md
+
+      - name: Build release
+        run: npm run build
+
+      - name: Smoke test
+        run: |
+          chmod +x dist/loader.js
+          export GSD_SMOKE_BINARY="$(pwd)/dist/loader.js"
+          npm run test:smoke
+
+      - name: Validate package
+        run: npm run validate-pack
+
+      - name: Commit, tag, and push
+        if: ${{ inputs.dry-run != true }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json CHANGELOG.md native/npm/*/package.json pkg/package.json packages/pi-coding-agent/package.json
+          git commit -m "release: v${{ steps.changelog.outputs.version }} [skip ci]"
+          git tag "v${{ steps.changelog.outputs.version }}"
+          git push origin main
+          git push origin "v${{ steps.changelog.outputs.version }}"
+
+      - name: Publish to npm
+        if: ${{ inputs.dry-run != true }}
+        run: |
+          OUTPUT=$(npm publish --provenance 2>&1) && echo "$OUTPUT" || {
+            if echo "$OUTPUT" | grep -q "cannot publish over the previously published"; then
+              echo "Version already published — skipping"
+            else
+              echo "$OUTPUT"
+              exit 1
+            fi
+          }
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        if: ${{ inputs.dry-run != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.changelog.outputs.version }}" \
+            --title "v${{ steps.changelog.outputs.version }}" \
+            --notes-file /tmp/release-notes.md \
+            --latest
+
+      - name: Log in to GHCR
+        if: ${{ inputs.dry-run != true }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker runtime image
+        if: ${{ inputs.dry-run != true }}
+        run: |
+          VERSION="${{ steps.changelog.outputs.version }}"
+          docker build --target runtime \
+            --build-arg GSD_VERSION="${VERSION}" \
+            -t ghcr.io/gsd-build/gsd-pi:latest \
+            -t ghcr.io/gsd-build/gsd-pi:${VERSION} \
+            .
+          docker push ghcr.io/gsd-build/gsd-pi:latest
+          docker push ghcr.io/gsd-build/gsd-pi:${VERSION}
+
+      - name: Post to Discord
+        if: ${{ inputs.dry-run != true && env.DISCORD_WEBHOOK != '' }}
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK }}
+        run: |
+          VERSION="${{ steps.changelog.outputs.version }}"
+          NOTES=$(cat /tmp/release-notes.md)
+          curl -s -X POST "$DISCORD_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg c "**GSD v${VERSION} Released**\n\n${NOTES}\n\n\`npm i gsd-pi@${VERSION}\`" '{content:$c}')"
+
+      - name: Summary
+        run: |
+          VERSION="${{ steps.changelog.outputs.version }}"
+          DRY_RUN="${{ inputs.dry-run }}"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "## 🧪 Dry Run Complete" >> "$GITHUB_STEP_SUMMARY"
+            echo "Would have released **v${VERSION}**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## 🚀 Released v${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- npm: \`gsd-pi@${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Docker: \`ghcr.io/gsd-build/gsd-pi:${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Changelog" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/release-notes.md >> "$GITHUB_STEP_SUMMARY"

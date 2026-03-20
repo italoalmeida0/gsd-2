@@ -1,10 +1,14 @@
-name: CI
+name: Checks
 
 on:
-  push:
-    branches: [main, feat/**]
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   secret-scan:
@@ -40,7 +44,6 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -73,7 +76,6 @@ jobs:
 
   windows-portability:
     runs-on: windows-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
