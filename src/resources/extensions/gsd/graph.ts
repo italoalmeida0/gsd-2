@@ -11,6 +11,7 @@
 import { parse, stringify } from "yaml";
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import type { WorkflowDefinition } from "./definition-loader.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -174,5 +175,31 @@ export function markStepComplete(
     steps: graph.steps.map((s) =>
       s.id === stepId ? { ...s, status: "complete" as const } : s,
     ),
+  };
+}
+
+// ─── Definition → Graph conversion ──────────────────────────────────────
+
+/**
+ * Convert a parsed WorkflowDefinition into a WorkflowGraph with all
+ * steps in "pending" status. Used by run-manager to generate the initial
+ * GRAPH.yaml for a new run.
+ *
+ * @param def — a validated WorkflowDefinition from definition-loader
+ * @returns WorkflowGraph with pending steps and metadata from the definition
+ */
+export function graphFromDefinition(def: WorkflowDefinition): WorkflowGraph {
+  return {
+    steps: def.steps.map((s) => ({
+      id: s.id,
+      title: s.name,
+      status: "pending" as const,
+      prompt: s.prompt,
+      dependsOn: s.requires ?? [],
+    })),
+    metadata: {
+      name: def.name,
+      createdAt: new Date().toISOString(),
+    },
   };
 }

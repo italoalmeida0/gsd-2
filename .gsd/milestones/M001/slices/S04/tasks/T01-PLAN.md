@@ -74,6 +74,13 @@ This task also writes unit tests for the definition loader to validate schema en
 - `npx tsc --noEmit --project tsconfig.extensions.json` — 0 errors
 - `node --import ./src/resources/extensions/gsd/tests/resolve-ts.mjs --experimental-strip-types --test src/resources/extensions/gsd/tests/custom-engine-integration.test.ts` — 11/11 still pass (regression check)
 
+## Observability Impact
+
+- **New signals:** `loadDefinition()` throws descriptive errors naming the exact field/index that failed validation (e.g., "Step at index 2 missing required field: id"). `validateDefinition()` returns structured `{ valid, errors[] }` for programmatic inspection.
+- **Inspection surface:** Parsed `WorkflowDefinition` objects are plain data — agents can log or serialize them. `graphFromDefinition()` output is a standard `WorkflowGraph` readable via `readGraph()` after write.
+- **Failure visibility:** Schema violations surface as thrown errors with specific messages. Missing file errors include the full expected path. All validation errors are collected (not short-circuit) so a single call reveals all problems.
+- **How to inspect:** Run `loadDefinition(defsDir, name)` in a test or REPL. Validation errors appear in the thrown error message. The returned `WorkflowDefinition` can be passed directly to `graphFromDefinition()` to inspect the resulting graph structure.
+
 ## Inputs
 
 - `src/resources/extensions/gsd/graph.ts` — existing graph data module to extend with `graphFromDefinition()`

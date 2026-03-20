@@ -41,7 +41,7 @@
 
 ## Tasks
 
-- [ ] **T01: Build definition-loader.ts and graphFromDefinition()** `est:25m`
+- [x] **T01: Build definition-loader.ts and graphFromDefinition()** `est:25m`
   - Why: The pure data layer — parsing YAML definitions and converting them to WorkflowGraph — must exist before run-manager or integration tests can be written. Covers R006 (V1 schema with version:1).
   - Files: `src/resources/extensions/gsd/definition-loader.ts`, `src/resources/extensions/gsd/graph.ts`, `src/resources/extensions/gsd/tests/definition-loader.test.ts`
   - Do: Create `definition-loader.ts` with `loadDefinition(defsDir, name)` and `validateDefinition(parsed)`. Add `graphFromDefinition(def)` to `graph.ts`. Export `WorkflowDefinition` and `StepDefinition` types. YAML uses snake_case (`depends_on`, `context_from`), TypeScript uses camelCase. Accept but don't process S05/S06 fields. Validate: version===1, name is string, each step has id/name/prompt, produces paths don't contain `..`. Write unit tests covering valid schema, missing version, missing step fields, path traversal rejection, unknown field acceptance.
