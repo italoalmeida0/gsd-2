@@ -91,3 +91,10 @@ Everything else in `dispatchNextUnit()` stays exactly as-is: budget checks, idem
 ## Expected Output
 
 - `src/resources/extensions/gsd/auto.ts` — modified: `dispatchNextUnit()` uses `resolveEngine()` for state derivation and dispatch resolution. Two new imports added. Two call sites changed. All other code paths unchanged.
+
+## Observability Impact
+
+- **Changed signal:** `dispatchNextUnit()` now routes initial state derivation through `engine.deriveState()` and dispatch resolution through `engine.resolveDispatch()`. The `derive-state` debug timer still fires with identical metadata.
+- **Inspection:** The `engine` variable is in scope for the full dispatch function body — a future breakpoint or log at line ~1057 reveals the resolved engine instance and its `engineId`.
+- **Failure signals:** If `resolveEngine(s)` throws (`"Unknown engine: ${id}"`), it surfaces before any state derivation runs — the error propagates up through `dispatchNextUnit`'s try/catch and triggers the reentrancy guard cleanup. If `engine.resolveDispatch()` returns an unexpected action shape, the bridge ternary falls through to `{ action: "skip" }`, triggering the existing skip/re-dispatch path.
+- **Unchanged:** The `handleAgentEnd` pipeline, budget checks, stuck detection, and supervision remain direct calls — no engine routing. Mid-function `deriveState` re-derivations stay as direct calls with manual `engineState` sync.

@@ -151,6 +151,8 @@ import {
   reconcileMergeState,
 } from "./auto-recovery.js";
 import { resolveDispatch, resetRewriteCircuitBreaker } from "./auto-dispatch.js";
+import { resolveEngine } from "./engine-resolver.js";
+import type { EngineState } from "./engine-types.js";
 import {
   type AutoDashboardData,
   updateProgressWidget as _updateProgressWidget,
@@ -1052,8 +1054,10 @@ async function dispatchNextUnit(
     // Non-fatal
   }
 
+  const { engine } = resolveEngine(s);
   const stopDeriveTimer = debugTime("derive-state");
-  let state = await deriveState(s.basePath);
+  let engineState: EngineState = await engine.deriveState(s.basePath);
+  let state = engineState.raw as GSDState;
   stopDeriveTimer({
     phase: state.phase,
     milestone: state.activeMilestone?.id,
@@ -1146,6 +1150,7 @@ async function dispatchNextUnit(
       invalidateAllCaches();
 
       state = await deriveState(s.basePath);
+      engineState = { phase: state.phase, currentMilestoneId: state.activeMilestone?.id ?? null, activeSliceId: state.activeSlice?.id ?? null, activeTaskId: state.activeTask?.id ?? null, isComplete: state.phase === "complete", raw: state };
       mid = state.activeMilestone?.id;
       midTitle = state.activeMilestone?.title;
 
@@ -1215,6 +1220,7 @@ async function dispatchNextUnit(
   if (reconcileMergeState(s.basePath, ctx)) {
     invalidateAllCaches();
     state = await deriveState(s.basePath);
+    engineState = { phase: state.phase, currentMilestoneId: state.activeMilestone?.id ?? null, activeSliceId: state.activeSlice?.id ?? null, activeTaskId: state.activeTask?.id ?? null, isComplete: state.phase === "complete", raw: state };
     mid = state.activeMilestone?.id;
     midTitle = state.activeMilestone?.title;
   }
@@ -1370,8 +1376,12 @@ async function dispatchNextUnit(
   }
 
   // ── Dispatch table ──
-  const dispatchResult = await resolveDispatch({ basePath: s.basePath, mid, midTitle: midTitle!, state, prefs,
-  });
+  const engineDispatch = await engine.resolveDispatch(engineState, { basePath: s.basePath });
+  const dispatchResult = engineDispatch.action === "dispatch"
+    ? { action: "dispatch" as const, unitType: engineDispatch.step.unitType, unitId: engineDispatch.step.unitId, prompt: engineDispatch.step.prompt }
+    : engineDispatch.action === "stop"
+      ? engineDispatch
+      : { action: "skip" as const };
 
   if (dispatchResult.action === "stop") {
     if (s.currentUnit) {
