@@ -1566,6 +1566,18 @@ export function mergeMilestoneToMain(
     // Non-fatal — proceed with merge; untracked files may block it
   }
 
+  // 7b. Clean up stale merge state files before starting the squash merge (#2912).
+  // A previous failed merge, libgit2 native path, or external tooling may leave
+  // MERGE_HEAD on disk. git refuses to start a new merge when MERGE_HEAD exists,
+  // causing `git merge --squash` to fail with "You have not concluded your merge".
+  try {
+    const gitDir_ = resolveGitDir(originalBasePath_);
+    for (const f of ["MERGE_HEAD", "MERGE_MSG", "SQUASH_MSG"]) {
+      const p = join(gitDir_, f);
+      if (existsSync(p)) unlinkSync(p);
+    }
+  } catch { /* best-effort — proceed and let the merge report the error if it fails */ }
+
   // 8. Squash merge — auto-resolve .gsd/ state file conflicts (#530)
   const mergeResult = nativeMergeSquash(originalBasePath_, milestoneBranch);
 
