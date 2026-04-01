@@ -22,6 +22,7 @@ import { normalizeStringArray } from "../shared/format-utils.js";
 import { resolveProfileDefaults as _resolveProfileDefaults } from "./preferences-models.js";
 
 import {
+  KNOWN_PREFERENCE_KEYS,
   MODE_DEFAULTS,
   type WorkflowMode,
   type GSDPreferences,
@@ -196,16 +197,36 @@ function loadPreferencesFile(path: string, scope: "global" | "project"): LoadedG
   };
 }
 
+let _warnedUnrecognizedFormat = false;
+
+/** @internal Reset the warn-once flag — exported for testing only. */
+export function _resetParseWarningFlag(): void {
+  _warnedUnrecognizedFormat = false;
+}
+
 /** @internal Exported for testing only */
 export function parsePreferencesMarkdown(content: string): GSDPreferences | null {
   // Use indexOf instead of [\s\S]*? regex to avoid backtracking (#468)
   const startMarker = content.startsWith('---\r\n') ? '---\r\n' : '---\n';
-  if (!content.startsWith(startMarker)) return null;
-  const searchStart = startMarker.length;
-  const endIdx = content.indexOf('\n---', searchStart);
-  if (endIdx === -1) return null;
-  const block = content.slice(searchStart, endIdx);
-  return parseFrontmatterBlock(block.replace(/\r/g, ''));
+  if (content.startsWith(startMarker)) {
+    const searchStart = startMarker.length;
+    const endIdx = content.indexOf('\n---', searchStart);
+    if (endIdx === -1) return null;
+    const block = content.slice(searchStart, endIdx);
+    return parseFrontmatterBlock(block.replace(/\r/g, ''));
+  }
+
+  // Fallback: heading+list format (e.g. "## Git\n- isolation: none") (#2036)
+  // GSD agents may write preferences files without frontmatter delimiters.
+  if (/^##\s+\w/m.test(content)) {
+    return parseHeadingListFormat(content);
+  }
+
+  if (!_warnedUnrecognizedFormat) {
+    _warnedUnrecognizedFormat = true;
+    console.warn("[parsePreferencesMarkdown] preferences.md exists but uses an unrecognized format — skipping.");
+  }
+  return null;
 }
 
 function parseFrontmatterBlock(frontmatter: string): GSDPreferences {
@@ -219,6 +240,68 @@ function parseFrontmatterBlock(frontmatter: string): GSDPreferences {
     console.error("[parseFrontmatterBlock] YAML parse error:", e);
     return {} as GSDPreferences;
   }
+}
+
+/**
+ * Parse heading+list format into a nested object, then cast to GSDPreferences.
+ * Handles markdown like:
+ *   ## Git
+ *   - isolation: none
+ *   - commit_docs: true
+ *   ## Models
+ *   - planner: sonnet
+ */
+function parseHeadingListFormat(content: string): GSDPreferences {
+  const result: Record<string, string[]> = {};
+  let currentSection: string | null = null;
+
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    const headingMatch = line.match(/^##\s+(.+)$/);
+    if (headingMatch) {
+      currentSection = headingMatch[1].trim().toLowerCase().replace(/\s+/g, '_');
+      if (!result[currentSection]) result[currentSection] = [];
+      continue;
+    }
+    if (currentSection && line.trim() && !line.trimStart().startsWith('#')) {
+      result[currentSection].push(line);
+    }
+  }
+
+  const typed: Record<string, unknown> = {};
+  for (const [section, lines] of Object.entries(result)) {
+    if (lines.length === 0) continue;
+
+    const usesLegacyListItems = lines.every((line) => /^\s*-\s+[^:]+:\s*.*$/.test(line));
+    const yamlBlock = usesLegacyListItems
+      ? lines.map((line) => line.replace(/^\s*-\s+/, '')).join('\n')
+      : lines.join('\n');
+
+    try {
+      const parsed = parseYaml(yamlBlock);
+      if (typeof parsed !== 'object' || parsed === null) continue;
+
+      let targetSection = section;
+      let value: unknown = parsed;
+
+      if (!Array.isArray(parsed)) {
+        const keys = Object.keys(parsed);
+        if (keys.length === 1) {
+          const [onlyKey] = keys;
+          if (onlyKey === section || (!KNOWN_PREFERENCE_KEYS.has(section) && KNOWN_PREFERENCE_KEYS.has(onlyKey))) {
+            targetSection = onlyKey;
+            value = (parsed as Record<string, unknown>)[onlyKey];
+          }
+        }
+      }
+
+      typed[targetSection] = value;
+    } catch {
+      /* malformed section — skip */
+    }
+  }
+
+  return typed as GSDPreferences;
 }
 
 // ─── Merging ────────────────────────────────────────────────────────────────
@@ -285,6 +368,9 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     github: (base.github || override.github)
       ? { ...(base.github ?? {}), ...(override.github ?? {}) } as import("../github-sync/types.js").GitHubSyncConfig
       : undefined,
+    service_tier: override.service_tier ?? base.service_tier,
+    forensics_dedup: override.forensics_dedup ?? base.forensics_dedup,
+    show_token_cost: override.show_token_cost ?? base.show_token_cost,
   };
 }
 
@@ -429,13 +515,17 @@ export function resolvePreDispatchHooks(): PreDispatchHookConfig[] {
 
 /**
  * Resolve the effective git isolation mode from preferences.
- * Returns "worktree" (default), "branch", or "none".
+ * Returns "none" (default), "worktree", or "branch".
+ *
+ * Default is "none" so GSD works out of the box without preferences.md.
+ * Worktree isolation requires explicit opt-in because it depends on git
+ * branch infrastructure that must be set up before use.
  */
 export function getIsolationMode(): "none" | "worktree" | "branch" {
   const prefs = loadEffectiveGSDPreferences()?.preferences?.git;
-  if (prefs?.isolation === "none") return "none";
+  if (prefs?.isolation === "worktree") return "worktree";
   if (prefs?.isolation === "branch") return "branch";
-  return "worktree"; // default
+  return "none"; // default — no isolation, work on current branch
 }
 
 export function resolveParallelConfig(prefs: GSDPreferences | undefined): import("./types.js").ParallelConfig {

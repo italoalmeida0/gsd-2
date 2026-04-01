@@ -13,7 +13,10 @@ Your goal is **not** to center the discussion on tech stack trivia, naming conve
 Do a lightweight targeted investigation so your questions are grounded in reality:
 - Scout the codebase (`rg`, `find`, or `scout` for broad unfamiliar areas) to understand what already exists that this slice touches or builds on
 - Check the roadmap context above to understand what surrounds this slice — what comes before, what depends on it
+- Use `resolve_library` / `get_library_docs` for unfamiliar libraries — prefer this over `search-the-web` for library documentation
 - Identify the 3–5 biggest behavioural unknowns: things where the user's answer will materially change what gets built
+
+**Web search budget:** You have a limited number of web searches per turn (typically 3-5). Prefer `resolve_library` / `get_library_docs` for library documentation and `search_and_read` for one-shot topic research — they are more budget-efficient. Target 2-3 web searches in the investigation pass. Distribute remaining searches across subsequent question rounds rather than clustering them.
 
 Do **not** go deep — just enough that your questions reflect what's actually true rather than what you assume.
 
@@ -45,7 +48,7 @@ Once the user is ready to wrap up:
 
 1. Use the **Slice Context** output template below
 2. `mkdir -p {{sliceDirPath}}`
-3. Write `{{contextPath}}` — use the template structure, filling in:
+3. Call `gsd_summary_save` with `milestone_id: {{milestoneId}}`, `slice_id: {{sliceId}}`, `artifact_type: "CONTEXT"`, and the context as `content` — the tool writes the file to disk and persists to DB. Use the template structure, filling in:
    - **Goal** — one sentence: what this slice delivers
    - **Why this Slice** — why now, what it unblocks
    - **Scope / In Scope** — what was confirmed in scope during the interview

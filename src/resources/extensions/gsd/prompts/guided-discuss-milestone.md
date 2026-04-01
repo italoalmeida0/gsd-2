@@ -13,7 +13,10 @@ Discuss milestone {{milestoneId}} ("{{milestoneTitle}}"). Identify gray areas, a
 Do a lightweight targeted investigation so your questions are grounded in reality:
 - Scout the codebase (`rg`, `find`, or `scout`) to understand what already exists that this milestone touches or builds on
 - Check the roadmap context above (if present) to understand what surrounds this milestone
+- Use `resolve_library` / `get_library_docs` for unfamiliar libraries — prefer this over `search-the-web` for library documentation
 - Identify the 3–5 biggest behavioural and architectural unknowns: things where the user's answer will materially change what gets built
+
+**Web search budget:** You have a limited number of web searches per turn (typically 3-5). Prefer `resolve_library` / `get_library_docs` for library documentation and `search_and_read` for one-shot topic research — they are more budget-efficient. Target 2-3 web searches in the investigation pass. Distribute remaining searches across subsequent question rounds rather than clustering them.
 
 Do **not** go deep — just enough that your questions reflect what's actually true rather than what you assume.
 
@@ -102,6 +105,6 @@ Once the user confirms depth:
 
 1. Use the **Context** output template below
 2. `mkdir -p` the milestone directory if needed
-3. Write `{{milestoneId}}-CONTEXT.md` — preserve the user's exact terminology, emphasis, and framing. Do not paraphrase nuance into generic summaries. The context file is downstream agents' only window into this conversation.
+3. Call `gsd_summary_save` with `milestone_id: {{milestoneId}}`, `artifact_type: "CONTEXT"`, and the full context markdown as `content` — the tool writes the file to disk and persists to DB. Preserve the user's exact terminology, emphasis, and framing in the content. Do not paraphrase nuance into generic summaries. The context file is downstream agents' only window into this conversation.
 4. {{commitInstruction}}
 5. Say exactly: `"{{milestoneId}} context written."` — nothing else.

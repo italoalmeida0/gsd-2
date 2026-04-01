@@ -8,7 +8,7 @@ Before asking "What do you want to add?", check the existing milestones context 
 
 1. Tell the user which milestones have draft contexts and briefly summarize what each draft contains (read the draft file).
 2. Use `ask_user_questions` to ask per-draft milestone:
-   - **"Discuss now"** — Treat this draft as the primary topic. Read the draft content, use it as seed material, and conduct a focused discussion following the standard discussion flow (reflection → investigation → questioning → depth verification → requirements → roadmap). After the discussion, write the full CONTEXT.md and delete the `CONTEXT-DRAFT.md` file. The milestone is then ready for auto-planning.
+   - **"Discuss now"** — Treat this draft as the primary topic. Read the draft content, use it as seed material, and conduct a focused discussion following the standard discussion flow (reflection → investigation → questioning → depth verification → requirements → roadmap). After the discussion, call `gsd_summary_save` with the milestone ID and `artifact_type: "CONTEXT"` to write the full context — then delete the `CONTEXT-DRAFT.md` file. The milestone is then ready for auto-planning.
    - **"Leave for later"** — Keep the draft as-is. The user will discuss it in a future session. Auto-mode will continue to pause when it reaches this milestone.
 3. Handle all draft discussions before proceeding to new queue work.
 4. If no drafts exist in the context, skip this section entirely and proceed to "What do you want to add?"
@@ -24,7 +24,7 @@ After they describe it, your job is to understand the new work deeply enough to 
 **Investigate between question rounds to make your questions smarter.** Before each round of questions, do enough lightweight research that your questions are grounded in reality — not guesses about what exists or what's possible.
 
 - Check library docs (`resolve_library` / `get_library_docs`) when the user mentions tech you need current facts about — capabilities, constraints, API shapes, version-specific behavior
-- Do web searches (`search-the-web`) to verify the landscape — what solutions exist, what's changed recently, what's the current best practice. Use `freshness` for recency-sensitive queries, `domain` to target specific sites. Use `fetch_page` to read the full content of promising URLs when snippets aren't enough.
+- Do web searches (`search-the-web`) to verify the landscape — what solutions exist, what's changed recently, what's the current best practice. Use `freshness` for recency-sensitive queries, `domain` to target specific sites. Use `fetch_page` to read the full content of promising URLs when snippets aren't enough. **Budget:** You have a limited number of web searches per turn (typically 3-5). Prefer `resolve_library` / `get_library_docs` for library documentation and `search_and_read` for one-shot topic research. Do NOT repeat the same or similar queries. Distribute searches across turns rather than clustering them.
 - Scout the codebase (`ls`, `find`, `rg`, or `scout` for broad unfamiliar areas) to understand what already exists, what patterns are established, what constraints current code imposes
 
 Don't go deep — just enough that your next question reflects what's actually true rather than what you assume.
@@ -107,8 +107,8 @@ The user confirms or corrects before you write. One depth verification per miles
 
 Once the user is satisfied, in a single pass for **each** new milestone:
 
-1. Call `gsd_generate_milestone_id` to get the milestone ID — never invent milestone IDs manually. Then `mkdir -p .gsd/milestones/<ID>/slices`.
-2. Write `.gsd/milestones/<ID>/<ID>-CONTEXT.md` — use the **Context** output template below. Capture intent, scope, risks, constraints, integration points, and relevant requirements. Mark the status as "Queued — pending auto-mode execution." **If this milestone depends on other milestones, add YAML frontmatter with `depends_on`:**
+1. Call `gsd_milestone_generate_id` to get the milestone ID — never invent milestone IDs manually. Then `mkdir -p .gsd/milestones/<ID>/slices`.
+2. Call `gsd_summary_save` with `milestone_id: <ID>`, `artifact_type: "CONTEXT"`, and the full context markdown as `content` — the tool computes the file path and persists to both DB and disk. Capture intent, scope, risks, constraints, integration points, and relevant requirements in the content. Mark the status as "Queued — pending auto-mode execution." **If this milestone depends on other milestones, include YAML frontmatter with `depends_on` in the content:**
    ```yaml
    ---
    depends_on: [M001, M002]

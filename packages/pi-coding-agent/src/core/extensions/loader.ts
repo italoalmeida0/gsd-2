@@ -42,6 +42,7 @@ import type {
 	Extension,
 	ExtensionAPI,
 	ExtensionFactory,
+	LifecycleHookHandler,
 	ExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
@@ -463,6 +464,22 @@ function createExtensionAPI(
 			extension.commands.set(name, { name, ...options });
 		},
 
+		registerBeforeInstall(handler: LifecycleHookHandler): void {
+			extension.lifecycleHooks.beforeInstall.push(handler);
+		},
+
+		registerAfterInstall(handler: LifecycleHookHandler): void {
+			extension.lifecycleHooks.afterInstall.push(handler);
+		},
+
+		registerBeforeRemove(handler: LifecycleHookHandler): void {
+			extension.lifecycleHooks.beforeRemove.push(handler);
+		},
+
+		registerAfterRemove(handler: LifecycleHookHandler): void {
+			extension.lifecycleHooks.afterRemove.push(handler);
+		},
+
 		registerShortcut(
 			shortcut: KeyId,
 			options: {
@@ -568,7 +585,58 @@ function createExtensionAPI(
 	return api;
 }
 
+/**
+ * Heuristic patterns that indicate TypeScript syntax in a source file.
+ * Used to detect when a .js file accidentally contains TypeScript code
+ * and provide a helpful error message instead of a cryptic parse failure.
+ */
+const TS_SYNTAX_PATTERNS: RegExp[] = [
+	// Variable type annotations: const name: string, let count: number
+	/\b(?:const|let|var)\s+\w+\s*:\s*(?:string|number|boolean|any|void|never|unknown|object|bigint|symbol|undefined|null)\b/,
+	// Parameter type annotations: (api: ExtensionAPI)
+	/\(\s*\w+\s*:\s*[A-Z]\w*/,
+	// Return type annotations: ): Promise<void> {  or  ): string =>
+	/\)\s*:\s*(?:Promise|string|number|boolean|void|any|never|unknown)\b/,
+	// Interface declarations
+	/\binterface\s+[A-Z]\w*\s*(?:<[^>]*>)?\s*\{/,
+	// Type alias declarations
+	/\btype\s+[A-Z]\w*\s*(?:<[^>]*>)?\s*=/,
+	// Angle-bracket type assertions: <Type>value
+	/(?:as\s+\w+(?:<[^>]*>)?)\s*[;,)\]}]/,
+	// Generic type parameters on functions: function foo<T>
+	/\bfunction\s+\w+\s*<[^>]+>/,
+	// Enum declarations
+	/\benum\s+[A-Z]\w*\s*\{/,
+];
+
+/**
+ * Check whether a source string likely contains TypeScript syntax.
+ * This is a heuristic — it may produce false positives for unusual JS,
+ * but is tuned to catch the most common TS-in-JS mistakes.
+ */
+export function containsTypeScriptSyntax(source: string): boolean {
+	return TS_SYNTAX_PATTERNS.some((pattern) => pattern.test(source));
+}
+
 async function loadExtensionModule(extensionPath: string) {
+	// Pre-compiled extension loading: if the source is .ts and a sibling .js
+	// file exists with matching or newer mtime, use native import() to skip
+	// jiti JIT compilation entirely.  This is the biggest startup win for
+	// bundled extensions that have already been built.
+	if (extensionPath.endsWith(".ts")) {
+		const jsPath = extensionPath.replace(/\.ts$/, ".js");
+		try {
+			const [tsStat, jsStat] = [fs.statSync(extensionPath), fs.statSync(jsPath)];
+			if (jsStat.mtimeMs >= tsStat.mtimeMs) {
+				const module = await import(jsPath);
+				const factory = (module.default ?? module) as ExtensionFactory;
+				return typeof factory !== "function" ? undefined : factory;
+			}
+		} catch {
+			// .js file doesn't exist or stat failed — fall through to jiti
+		}
+	}
+
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false,
 		...getJitiOptions(),
@@ -577,6 +645,46 @@ async function loadExtensionModule(extensionPath: string) {
 	const module = await jiti.import(extensionPath, { default: true });
 	const factory = module as ExtensionFactory;
 	return typeof factory !== "function" ? undefined : factory;
+}
+
+/**
+ * Check whether a module path belongs to a non-extension library that should
+ * be silently skipped rather than reported as an error.
+ *
+ * A directory is a non-extension library when its package.json has a "pi"
+ * manifest that declares no extensions (e.g. `"pi": {}`). This is the
+ * opt-out convention used by shared libraries like cmux that live inside
+ * the extensions/ directory but are not extensions themselves.
+ *
+ * This serves as a defense-in-depth check: even if the upstream discovery
+ * layers fail to filter out the library, the loader itself will not emit
+ * a spurious error.
+ */
+function isNonExtensionLibrary(resolvedPath: string): boolean {
+	// Walk up from the resolved file to find the nearest package.json
+	let dir = path.dirname(resolvedPath);
+	const root = path.parse(dir).root;
+	while (dir !== root) {
+		const packageJsonPath = path.join(dir, "package.json");
+		if (fs.existsSync(packageJsonPath)) {
+			try {
+				const content = fs.readFileSync(packageJsonPath, "utf-8");
+				const pkg = JSON.parse(content);
+				if (pkg.pi && typeof pkg.pi === "object") {
+					// Has a pi manifest — check if it declares any extensions
+					const extensions = pkg.pi.extensions;
+					if (!Array.isArray(extensions) || extensions.length === 0) {
+						return true;
+					}
+				}
+			} catch {
+				// Malformed package.json — not a known library
+			}
+			break;
+		}
+		dir = path.dirname(dir);
+	}
+	return false;
 }
 
 /**
@@ -592,6 +700,12 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		lifecycleHooks: {
+			beforeInstall: [],
+			afterInstall: [],
+			beforeRemove: [],
+			afterRemove: [],
+		},
 	};
 }
 
@@ -607,7 +721,29 @@ async function loadExtension(
 	try {
 		const factory = await loadExtensionModule(resolvedPath);
 		if (!factory) {
+			// Defense-in-depth: if the module is inside a directory that has
+			// explicitly opted out of extension loading via its pi manifest,
+			// silently skip it instead of reporting a spurious error.
+			if (isNonExtensionLibrary(resolvedPath)) {
+				return { extension: null, error: null };
+			}
 			logExtensionTiming(extensionPath, Date.now() - start, "failed");
+
+			// Check if a .js file contains TypeScript syntax
+			if (resolvedPath.endsWith(".js")) {
+				try {
+					const source = fs.readFileSync(resolvedPath, "utf-8");
+					if (containsTypeScriptSyntax(source)) {
+						return {
+							extension: null,
+							error: `Extension file "${extensionPath}" appears to contain TypeScript syntax but has a .js extension. Rename it to .ts so the loader can compile it.`,
+						};
+					}
+				} catch {
+					// Could not read file — fall through to generic error
+				}
+			}
+
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
@@ -620,6 +756,23 @@ async function loadExtension(
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		logExtensionTiming(extensionPath, Date.now() - start, "failed");
+
+		// Check if a .js file contains TypeScript syntax — the parse error from
+		// jiti/Node is often cryptic, so surface a clearer diagnostic.
+		if (resolvedPath.endsWith(".js")) {
+			try {
+				const source = fs.readFileSync(resolvedPath, "utf-8");
+				if (containsTypeScriptSyntax(source)) {
+					return {
+						extension: null,
+						error: `Extension file "${extensionPath}" appears to contain TypeScript syntax but has a .js extension. Rename it to .ts so the loader can compile it.`,
+					};
+				}
+			} catch {
+				// Could not read file — fall through to generic error
+			}
+		}
+
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
 }
@@ -788,6 +941,11 @@ function discoverExtensionsInDir(dir: string): string[] {
 
 /**
  * Discover and load extensions from standard locations.
+ *
+ * @deprecated Use DefaultResourceLoader.reload() instead — this function is
+ * not called in the GSD loading flow. Extension discovery happens through
+ * DefaultPackageManager.resolve() → addAutoDiscoveredResources(). Kept for
+ * backwards compatibility with direct pi-coding-agent consumers.
  */
 export async function discoverAndLoadExtensions(
 	configuredPaths: string[],

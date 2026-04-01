@@ -5,11 +5,13 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 	getSlashCommandContext: () => any;
 	handleBashCommand: (command: string, excludeFromContext?: boolean) => Promise<void>;
 	showWarning: (message: string) => void;
+	showError: (message: string) => void;
 	updateEditorBorderColor: () => void;
 	isExtensionCommand: (text: string) => boolean;
 	queueCompactionMessage: (text: string, mode: "steer" | "followUp") => void;
 	updatePendingMessagesDisplay: () => void;
 	flushPendingBashComponents: () => void;
+	options?: { submitPromptsDirectly?: boolean };
 }): void {
 	host.defaultEditor.onSubmit = async (text: string) => {
 		text = text.trim();
@@ -44,7 +46,12 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 			if (host.isExtensionCommand(text)) {
 				host.editor.addToHistory?.(text);
 				host.editor.setText("");
-				await host.session.prompt(text);
+				try {
+					await host.session.prompt(text);
+				} catch (error: unknown) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					host.showError(errorMessage);
+				}
 			} else {
 				host.queueCompactionMessage(text, "steer");
 			}
@@ -61,8 +68,32 @@ export function setupEditorSubmitHandler(host: InteractiveModeStateHost & {
 		}
 
 		host.flushPendingBashComponents();
-		host.onInputCallback?.(text);
+
+		if (host.onInputCallback) {
+			host.onInputCallback(text);
+			host.editor.addToHistory?.(text);
+			return;
+		}
+
+		if (host.options?.submitPromptsDirectly) {
+			host.editor.addToHistory?.(text);
+			try {
+				await host.session.prompt(text);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				host.showError(errorMessage);
+			}
+			return;
+		}
+
 		host.editor.addToHistory?.(text);
+		// submitPromptsDirectly is false — still dispatch via session.prompt so user input
+		// is not silently discarded.
+		try {
+			await host.session.prompt(text);
+		} catch (error: unknown) {
+			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+			host.showError(errorMessage);
+		}
 	};
 }
-

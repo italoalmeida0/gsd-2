@@ -13,7 +13,8 @@ import { resolve } from "node:path";
 import type { ExtensionAPI, Theme } from "@gsd/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, wrapTextWithAnsi } from "@gsd/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { makeUI, maskEditorLine, type ProgressStatus } from "./shared/mod.js";
+import { makeUI } from "./shared/tui.js";
+import { maskEditorLine, type ProgressStatus } from "./shared/mod.js";
 import { parseSecretsManifest, formatSecretsManifest } from "./gsd/files.js";
 import { resolveMilestoneFile } from "./gsd/paths.js";
 import type { SecretsManifestEntry } from "./gsd/types.js";
@@ -46,7 +47,16 @@ function shellEscapeSingle(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function hydrateProcessEnv(key: string, value: string): void {
+	// Make newly collected secrets immediately visible to the current session.
+	// Some extensions read process.env directly and do not reload .env on every call.
+	process.env[key] = value;
+}
+
 async function writeEnvKey(filePath: string, key: string, value: string): Promise<void> {
+	if (typeof value !== "string") {
+		throw new TypeError(`writeEnvKey expects a string value for key "${key}", got ${typeof value}`);
+	}
 	let content = "";
 	try {
 		content = await readFile(filePath, "utf8");
@@ -234,7 +244,7 @@ export async function showSecretsSummary(
 
 	const existingSet = new Set(existingKeys);
 
-	await ctx.ui.custom((tui: any, theme: Theme, _kb: any, done: (r: null) => void) => {
+	await ctx.ui.custom((_tui: any, theme: Theme, _kb: any, done: (r: null) => void) => {
 		let cachedLines: string[] | undefined;
 
 		function handleInput(_data: string) {
@@ -311,6 +321,7 @@ async function applySecrets(
 			try {
 				await writeEnvKey(opts.envFilePath, key, value);
 				applied.push(key);
+				hydrateProcessEnv(key, value);
 			} catch (err: any) {
 				errors.push(`${key}: ${err.message}`);
 			}
@@ -329,6 +340,7 @@ async function applySecrets(
 					errors.push(`${key}: ${result.stderr.slice(0, 200)}`);
 				} else {
 					applied.push(key);
+					hydrateProcessEnv(key, value);
 				}
 			} catch (err: any) {
 				errors.push(`${key}: ${err.message}`);
@@ -410,7 +422,7 @@ export async function collectSecretsFromManifest(
 	for (const { key, value } of collected) {
 		const entry = manifest.entries.find((e) => e.key === key);
 		if (entry) {
-			entry.status = value !== null ? "collected" : "skipped";
+			entry.status = value != null ? "collected" : "skipped";
 		}
 	}
 
@@ -418,14 +430,14 @@ export async function collectSecretsFromManifest(
 	await writeFile(manifestPath, formatSecretsManifest(manifest), "utf8");
 
 	// (j) Apply collected values to destination
-	const provided = collected.filter((c) => c.value !== null) as Array<{ key: string; value: string }>;
+	const provided = collected.filter((c) => c.value != null) as Array<{ key: string; value: string }>;
 	const { applied } = await applySecrets(provided, destination, {
 		envFilePath: resolve(ctx.cwd, ".env"),
 	});
 
 	const skipped = [
 		...alreadySkipped,
-		...collected.filter((c) => c.value === null).map((c) => c.key),
+		...collected.filter((c) => c.value == null).map((c) => c.key),
 	];
 
 	return { applied, skipped, existingSkipped };
@@ -496,8 +508,8 @@ export default function secureEnv(pi: ExtensionAPI) {
 				collected.push({ key: item.key, value });
 			}
 
-			const provided = collected.filter((c) => c.value !== null) as Array<{ key: string; value: string }>;
-			const skipped = collected.filter((c) => c.value === null).map((c) => c.key);
+			const provided = collected.filter((c) => c.value != null) as Array<{ key: string; value: string }>;
+			const skipped = collected.filter((c) => c.value == null).map((c) => c.key);
 
 			// Apply to destination via shared helper
 			const { applied, errors } = await applySecrets(provided, destination, {

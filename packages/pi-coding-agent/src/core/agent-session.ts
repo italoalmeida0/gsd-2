@@ -72,6 +72,7 @@ import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import { RetryHandler } from "./retry-handler.js";
+import { isImageDimensionError, downsizeConversationImages } from "./image-overflow-recovery.js";
 import type { BranchSummaryEntry, SessionManager } from "./session-manager.js";
 import { getLatestCompactionEntry } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
@@ -108,8 +109,22 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 }
 
 /** Session-specific events that extend the core AgentEvent */
+export type SessionStateChangeReason =
+	| "set_model"
+	| "set_thinking_level"
+	| "set_steering_mode"
+	| "set_follow_up_mode"
+	| "set_auto_compaction"
+	| "set_auto_retry"
+	| "abort_retry"
+	| "new_session"
+	| "switch_session"
+	| "set_session_name"
+	| "fork";
+
 export type AgentSessionEvent =
 	| AgentEvent
+	| { type: "session_state_changed"; reason: SessionStateChangeReason }
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" }
 	| {
 			type: "auto_compaction_end";
@@ -122,7 +137,8 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "fallback_provider_switch"; from: string; to: string; reason: string }
 	| { type: "fallback_provider_restored"; provider: string; reason: string }
-	| { type: "fallback_chain_exhausted"; reason: string };
+	| { type: "fallback_chain_exhausted"; reason: string }
+	| { type: "image_overflow_recovery"; strippedCount: number; imageCount: number };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -241,6 +257,10 @@ export class AgentSession {
 	private _cumulativeOutputTokens = 0;
 	private _cumulativeToolCalls = 0;
 
+	/** Cost of the most recent assistant response (for per-prompt display). */
+	private _lastTurnCost = 0;
+
+
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
@@ -356,6 +376,10 @@ export class AgentSession {
 		}
 	}
 
+	private _emitSessionStateChanged(reason: SessionStateChangeReason): void {
+		this._emit({ type: "session_state_changed", reason });
+	}
+
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -436,6 +460,7 @@ export class AgentSession {
 
 				// Accumulate session stats that survive compaction (#1423)
 				const assistantMsg = event.message as AssistantMessage;
+				this._lastTurnCost = assistantMsg.usage?.cost?.total ?? 0;
 				this._cumulativeCost += assistantMsg.usage?.cost?.total ?? 0;
 				this._cumulativeInputTokens += assistantMsg.usage?.input ?? 0;
 				this._cumulativeOutputTokens += assistantMsg.usage?.output ?? 0;
@@ -462,6 +487,36 @@ export class AgentSession {
 			if (this._retryHandler.isRetryableError(msg)) {
 				const didRetry = await this._retryHandler.handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
+			}
+
+			// Check for image dimension overflow (many-image 400 error).
+			// When a session accumulates many images, the API rejects requests
+			// whose images exceed the many-image dimension limit. Strip older
+			// images from the conversation and auto-retry. (#2874)
+			if (
+				msg.stopReason === "error" &&
+				isImageDimensionError(msg.errorMessage)
+			) {
+				const messages = this.agent.state.messages;
+				const result = downsizeConversationImages(messages as Message[]);
+				if (result.processed) {
+					// Remove the trailing error assistant message, then replace
+					if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
+						this.agent.replaceMessages(messages.slice(0, -1));
+					}
+
+					this._emit({
+						type: "image_overflow_recovery",
+						strippedCount: result.strippedCount,
+						imageCount: result.imageCount,
+					});
+
+					// Auto-retry after downsizing
+					setTimeout(() => {
+						this.agent.continue().catch(() => {});
+					}, 0);
+					return;
+				}
 			}
 
 			await this._compactionOrchestrator.checkCompaction(msg);
@@ -669,6 +724,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._extensionErrorUnsubscriber?.();
+		this._extensionErrorUnsubscriber = undefined;
 		this._disconnectFromAgent();
 		this._eventListeners = [];
 	}
@@ -1029,9 +1086,8 @@ export class AgentSession {
 			});
 		}
 
-		// Validate API key
-		const apiKey = await this._modelRegistry.getApiKey(this.model, this.sessionId);
-		if (!apiKey) {
+		// Validate provider readiness
+		if (!this._modelRegistry.isProviderRequestReady(this.model.provider)) {
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
 				throw new Error(
@@ -1543,6 +1599,7 @@ export class AgentSession {
 		}
 
 		// Emit session event to custom tools
+		this._emitSessionStateChanged("new_session");
 		return true;
 	}
 
@@ -1583,16 +1640,16 @@ export class AgentSession {
 		}
 		this.setThinkingLevel(thinkingLevel);
 		await this._emitModelSelect(model, previousModel, source);
+		this._emitSessionStateChanged("set_model");
 	}
 
 	/**
 	 * Set model directly.
-	 * Validates API key, saves to session and settings.
-	 * @throws Error if no API key available for the model
+	 * Validates provider readiness, saves to session and settings.
+	 * @throws Error if provider is not ready (missing credentials for apiKey/oauth providers)
 	 */
 	async setModel(model: Model<any>, options?: { persist?: boolean }): Promise<void> {
-		const apiKey = await this._modelRegistry.getApiKey(model, this.sessionId);
-		if (!apiKey) {
+		if (!this._modelRegistry.isProviderRequestReady(model.provider)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
 
@@ -1613,30 +1670,14 @@ export class AgentSession {
 		return this._cycleAvailableModel(direction, options);
 	}
 
-	private async _getScopedModelsWithApiKey(): Promise<Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>> {
-		const apiKeysByProvider = new Map<string, string | undefined>();
-		const result: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }> = [];
-
-		for (const scoped of this._scopedModels) {
-			const provider = scoped.model.provider;
-			let apiKey: string | undefined;
-			if (apiKeysByProvider.has(provider)) {
-				apiKey = apiKeysByProvider.get(provider);
-			} else {
-				apiKey = await this._modelRegistry.getApiKeyForProvider(provider, this.sessionId);
-				apiKeysByProvider.set(provider, apiKey);
-			}
-
-			if (apiKey) {
-				result.push(scoped);
-			}
-		}
-
-		return result;
+	private _getReadyScopedModels(): Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }> {
+		return this._scopedModels.filter((scoped) =>
+			this._modelRegistry.isProviderRequestReady(scoped.model.provider),
+		);
 	}
 
 	private async _cycleScopedModel(direction: "forward" | "backward", options?: { persist?: boolean }): Promise<ModelCycleResult | undefined> {
-		const scopedModels = await this._getScopedModelsWithApiKey();
+		const scopedModels = this._getReadyScopedModels();
 		if (scopedModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -1667,11 +1708,6 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const nextModel = availableModels[nextIndex];
 
-		const apiKey = await this._modelRegistry.getApiKey(nextModel, this.sessionId);
-		if (!apiKey) {
-			throw new Error(`No API key for ${nextModel.provider}/${nextModel.id}`);
-		}
-
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
 		await this._applyModelChange(nextModel, thinkingLevel, "cycle", options);
 
@@ -1701,6 +1737,7 @@ export class AgentSession {
 			if (this.supportsThinking() || effectiveLevel !== "off") {
 				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
 			}
+			this._emitSessionStateChanged("set_thinking_level");
 		}
 	}
 
@@ -1782,6 +1819,7 @@ export class AgentSession {
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
 		this.agent.setSteeringMode(mode);
 		this.settingsManager.setSteeringMode(mode);
+		this._emitSessionStateChanged("set_steering_mode");
 	}
 
 	/**
@@ -1791,6 +1829,7 @@ export class AgentSession {
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
 		this.agent.setFollowUpMode(mode);
 		this.settingsManager.setFollowUpMode(mode);
+		this._emitSessionStateChanged("set_follow_up_mode");
 	}
 
 	// =========================================================================
@@ -1819,6 +1858,7 @@ export class AgentSession {
 	/** Toggle auto-compaction setting */
 	setAutoCompactionEnabled(enabled: boolean): void {
 		this._compactionOrchestrator.setAutoCompactionEnabled(enabled);
+		this._emitSessionStateChanged("set_auto_compaction");
 	}
 
 	/** Whether auto-compaction is enabled */
@@ -1904,7 +1944,11 @@ export class AgentSession {
 		runner.setUIContext(this._extensionUIContext);
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
-		this._extensionErrorUnsubscriber?.();
+		try {
+			this._extensionErrorUnsubscriber?.();
+		} catch {
+			// Ignore errors from previous unsubscriber
+		}
 		this._extensionErrorUnsubscriber = this._extensionErrorListener
 			? runner.onError(this._extensionErrorListener)
 			: undefined;
@@ -1974,6 +2018,11 @@ export class AgentSession {
 					const messages = this.agent.state.messages;
 					const last = messages[messages.length - 1];
 					if (last?.role === "assistant" && (last as AssistantMessage).stopReason === "error") {
+						// If the error was an image dimension overflow, downsize images
+						// before retrying so the retry doesn't hit the same error (#2874)
+						if (isImageDimensionError((last as AssistantMessage).errorMessage)) {
+							downsizeConversationImages(messages as Message[]);
+						}
 						this.agent.replaceMessages(messages.slice(0, -1));
 						this.agent.continue().catch((err) => {
 							runner.emitError({
@@ -2002,8 +2051,7 @@ export class AgentSession {
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
 				setModel: async (model, options) => {
-					const key = await this.modelRegistry.getApiKey(model, this.sessionId);
-					if (!key) return false;
+					if (!this.modelRegistry.isProviderRequestReady(model.provider)) return false;
 					await this.setModel(model, options);
 					return true;
 				},
@@ -2188,7 +2236,11 @@ export class AgentSession {
 
 	/** Cancel in-progress retry */
 	abortRetry(): void {
+		const hadRetry = this._retryHandler.isRetrying;
 		this._retryHandler.abortRetry();
+		if (hadRetry) {
+			this._emitSessionStateChanged("abort_retry");
+		}
 	}
 
 	/** Whether auto-retry is currently in progress */
@@ -2204,6 +2256,7 @@ export class AgentSession {
 	/** Toggle auto-retry setting */
 	setAutoRetryEnabled(enabled: boolean): void {
 		this._retryHandler.setAutoRetryEnabled(enabled);
+		this._emitSessionStateChanged("set_auto_retry");
 	}
 
 	// =========================================================================
@@ -2221,7 +2274,7 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; operations?: BashOperations },
+		options?: { excludeFromContext?: boolean; operations?: BashOperations; loginShell?: boolean },
 	): Promise<BashResult> {
 		this._bashAbortController = new AbortController();
 
@@ -2238,6 +2291,7 @@ export class AgentSession {
 				: await executeBashCommand(resolvedCommand, {
 						onChunk,
 						signal: this._bashAbortController.signal,
+						loginShell: options?.loginShell,
 					});
 
 			this.recordBashResult(command, result, options);
@@ -2393,6 +2447,7 @@ export class AgentSession {
 		}
 
 		this._reconnectToAgent();
+		this._emitSessionStateChanged("switch_session");
 		return true;
 	}
 
@@ -2401,6 +2456,7 @@ export class AgentSession {
 	 */
 	setSessionName(name: string): void {
 		this.sessionManager.appendSessionInfo(name);
+		this._emitSessionStateChanged("set_session_name");
 	}
 
 	/**
@@ -2464,6 +2520,7 @@ export class AgentSession {
 			this.agent.replaceMessages(sessionContext.messages);
 		}
 
+		this._emitSessionStateChanged("fork");
 		return { selectedText, cancelled: false };
 	}
 
@@ -2565,10 +2622,10 @@ export class AgentSession {
 		let summaryDetails: unknown;
 		if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 			const model = this.model!;
-			const apiKey = await this._modelRegistry.getApiKey(model, this.sessionId);
-			if (!apiKey) {
+			if (!this._modelRegistry.isProviderRequestReady(model.provider)) {
 				throw new Error(`No API key for ${model.provider}`);
 			}
+			const apiKey = await this._modelRegistry.getApiKey(model, this.sessionId);
 			const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 			const result = await generateBranchSummary(entriesToSummarize, {
 				model,
@@ -2740,6 +2797,14 @@ export class AgentSession {
 			},
 			cost: Math.max(totalCost, this._cumulativeCost),
 		};
+	}
+
+	/**
+	 * Get the cost of the most recent assistant response.
+	 * Returns 0 if no assistant message has been received yet.
+	 */
+	getLastTurnCost(): number {
+		return this._lastTurnCost;
 	}
 
 	getContextUsage(): ContextUsage | undefined {

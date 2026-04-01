@@ -58,6 +58,8 @@ interface GitBatchInfo {
 interface GitMergeResult {
   success: boolean;
   conflicts: string[];
+  /** Filenames extracted from git stderr when a dirty working tree blocks the merge (#2151). */
+  dirtyFiles?: string[];
 }
 
 // ─── Native Module Loading ──────────────────────────────────────────────────
@@ -207,7 +209,9 @@ export function nativeDetectMainBranch(basePath: string): string {
 /**
  * Check if a local branch exists.
  * Native: checks refs/heads/<name> via libgit2.
- * Fallback: `git show-ref --verify`.
+ * Fallback: `git show-ref --verify`, with unborn-branch detection
+ * so that the current branch in a zero-commit repo is treated as
+ * existing (fixes #1771).
  */
 export function nativeBranchExists(basePath: string, branch: string): boolean {
   const native = loadNative();
@@ -215,7 +219,12 @@ export function nativeBranchExists(basePath: string, branch: string): boolean {
     return native.gitBranchExists(basePath, branch);
   }
   const result = gitExec(basePath, ["show-ref", "--verify", `refs/heads/${branch}`], true);
-  return result !== "";
+  if (result !== "") return true;
+
+  // show-ref fails for unborn branches (zero commits). Fall back to checking
+  // whether the requested branch is the current (unborn) branch.
+  const current = gitExec(basePath, ["branch", "--show-current"], true);
+  return current === branch;
 }
 
 /**
@@ -672,6 +681,16 @@ export function nativeAddAll(basePath: string): void {
 }
 
 /**
+ * Stage only already-tracked files (git add -u).
+ * Does NOT add new untracked files — only updates modifications and deletions
+ * for files git already knows about. Safe for automated snapshots where
+ * pulling in unknown untracked files (secrets, binaries) would be dangerous.
+ */
+export function nativeAddTracked(basePath: string): void {
+  gitFileExec(basePath, ["add", "-u"]);
+}
+
+/**
  * Stage all files with pathspec exclusions (git add -A -- ':!pattern' ...).
  * Excluded paths are never hashed by git, preventing hangs on large
  * untracked artifact trees (57GB+, 11K+ files). See #1605.
@@ -698,10 +717,17 @@ export function nativeAddAllWithExclusions(basePath: string, exclusions: readonl
       env: GIT_NO_PROMPT_ENV,
     });
   } catch (err: unknown) {
+    const stderr = (err as { stderr?: string })?.stderr ?? "";
     // git exits 1 when pathspec exclusions reference paths already covered
     // by .gitignore. The staging itself succeeds — only suppress that case.
-    const stderr = (err as { stderr?: string })?.stderr ?? "";
     if (stderr.includes("ignored by one of your .gitignore files")) {
+      return;
+    }
+    // When .gsd is a symlink, git rejects `:!.gsd/...` pathspecs with
+    // "beyond a symbolic link". Fall back to plain `git add -A` which
+    // respects .gitignore (where .gsd/ is listed by default).
+    if (stderr.includes("beyond a symbolic link")) {
+      nativeAddAll(basePath);
       return;
     }
     throw new GSDError(GSD_GIT_ERROR, `git add -A with exclusions failed in ${basePath}: ${getErrorMessage(err)}`);
@@ -794,7 +820,7 @@ export function nativeCheckoutBranch(basePath: string, branch: string): void {
     native.gitCheckoutBranch(basePath, branch);
     return;
   }
-  execSync(`git checkout ${branch}`, {
+  execFileSync("git", ["checkout", branch], {
     cwd: basePath,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf-8",
@@ -829,17 +855,47 @@ export function nativeMergeSquash(basePath: string, branch: string): GitMergeRes
   }
 
   try {
-    execSync(`git merge --squash ${branch}`, {
+    execFileSync("git", ["merge", "--squash", branch], {
       cwd: basePath,
       stdio: ["ignore", "pipe", "pipe"],
       encoding: "utf-8",
+      env: GIT_NO_PROMPT_ENV,
     });
     return { success: true, conflicts: [] };
-  } catch {
-    // Check for conflicts
+  } catch (err: unknown) {
+    // Distinguish pre-merge rejections (dirty working tree) from actual
+    // content conflicts.  When git rejects the merge before staging
+    // ("local changes would be overwritten"), there are no conflict markers
+    // to detect, so the old --diff-filter=U check would return an empty
+    // list and incorrectly report success (#1672, #1738).
+    const stderr =
+      err instanceof Error ? (err as Error & { stderr?: string }).stderr ?? err.message : String(err);
+    if (
+      stderr.includes("local changes would be overwritten") ||
+      stderr.includes("not possible because you have unmerged files") ||
+      stderr.includes("overwritten by merge")
+    ) {
+      // Extract filenames from git stderr so callers can report which files
+      // are dirty instead of generically blaming .gsd/ (#2151).
+      // Git lists them as tab-indented lines between the "would be overwritten"
+      // header and the "Please commit" footer.
+      const dirtyFiles = stderr
+        .split("\n")
+        .filter((line) => line.startsWith("\t"))
+        .map((line) => line.trim())
+        .filter(Boolean);
+      return { success: false, conflicts: ["__dirty_working_tree__"], dirtyFiles };
+    }
+
+    // Check for real content conflicts
     const conflictOutput = gitExec(basePath, ["diff", "--name-only", "--diff-filter=U"], true);
     const conflicts = conflictOutput ? conflictOutput.split("\n").filter(Boolean) : [];
-    return { success: conflicts.length === 0, conflicts };
+    if (conflicts.length > 0) {
+      return { success: false, conflicts };
+    }
+    // No conflicts detected — this is a non-conflict failure; re-throw
+    // so the caller knows the merge did not succeed.
+    throw err;
   }
 }
 
@@ -883,6 +939,37 @@ export function nativeResetHard(basePath: string): void {
     return;
   }
   execSync("git reset --hard HEAD", { cwd: basePath, stdio: "pipe" });
+}
+
+/**
+ * Soft reset to a target ref (git reset --soft <ref>).
+ * Moves HEAD to `target` while keeping all changes staged in the index.
+ * Used to squash snapshot commits back into a single real commit.
+ */
+export function nativeResetSoft(basePath: string, target: string): void {
+  execFileSync("git", ["reset", "--soft", target], {
+    cwd: basePath,
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf-8",
+    env: GIT_NO_PROMPT_ENV,
+  });
+}
+
+/**
+ * Get the subject line of a commit (git log -1 --format=%s <ref>).
+ * Returns empty string if the ref doesn't exist.
+ */
+export function nativeCommitSubject(basePath: string, ref: string): string {
+  try {
+    return execFileSync("git", ["log", "-1", "--format=%s", ref], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      env: GIT_NO_PROMPT_ENV,
+    }).trim();
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -1063,6 +1150,62 @@ export function nativeUpdateRef(basePath: string, refname: string, target?: stri
  */
 export function isNativeGitAvailable(): boolean {
   return loadNative() !== null;
+}
+
+/**
+ * Check if a commit/branch is an ancestor of another.
+ * Returns true if `ancestor` is reachable from `descendant`.
+ * Fallback: `git merge-base --is-ancestor`.
+ */
+export function nativeIsAncestor(basePath: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: GIT_NO_PROMPT_ENV,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Get the Unix epoch (seconds) of the latest commit on a ref.
+ * Returns 0 if the ref doesn't exist or has no commits.
+ * Fallback: `git log -1 --format=%ct <ref>`.
+ */
+export function nativeLastCommitEpoch(basePath: string, ref: string): number {
+  try {
+    const result = execFileSync("git", ["log", "-1", "--format=%ct", ref], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      env: GIT_NO_PROMPT_ENV,
+    }).trim();
+    return parseInt(result, 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Count commits on `branch` that are not on any remote tracking branch.
+ * Returns the count of unpushed commits, or -1 if the branch has no upstream.
+ * Fallback: `git rev-list <branch> --not --remotes`.
+ */
+export function nativeUnpushedCount(basePath: string, branch: string): number {
+  try {
+    const result = execFileSync("git", ["rev-list", branch, "--not", "--remotes", "--count"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      env: GIT_NO_PROMPT_ENV,
+    }).trim();
+    return parseInt(result, 10) || 0;
+  } catch {
+    return -1;
+  }
 }
 
 // ─── Re-exports for type consumers ──────────────────────────────────────

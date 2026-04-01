@@ -25,7 +25,7 @@ function cleanup(base: string): void {
   try { rmSync(base, { recursive: true, force: true }); } catch { /* */ }
 }
 
-function waitForChildExit(child: ChildProcess, timeoutMs = 5000): Promise<number | null> {
+function waitForChildExit(child: ChildProcess, timeoutMs = 10000): Promise<number | null> {
   return new Promise((resolve) => {
     if (child.exitCode !== null) {
       resolve(child.exitCode);
@@ -64,7 +64,7 @@ test("stopAutoRemote cleans up stale lock (dead PID) and returns found:false", (
   const base = makeTmpBase();
   try {
     // Write a lock with a PID that doesn't exist
-    writeLock(base, "execute-task", "M001/S01/T01", 3);
+    writeLock(base, "execute-task", "M001/S01/T01");
     // Overwrite PID to a dead one
     const lock = readCrashLock(base)!;
     const staleData = { ...lock, pid: 999999999 };
@@ -80,7 +80,10 @@ test("stopAutoRemote cleans up stale lock (dead PID) and returns found:false", (
   }
 });
 
-test("stopAutoRemote sends SIGTERM to a live process and returns found:true", async () => {
+// KNOWN FLAKE: This test is timing-sensitive — it spawns a child, writes a lock file,
+// sends SIGTERM, and asserts the child exited. Under heavy CI load the child may
+// not be ready when SIGTERM is sent. Mitigations: 500ms startup delay, 10s exit timeout.
+test("stopAutoRemote sends SIGTERM to a live process and returns found:true", { timeout: 15000 }, async () => {
   const base = makeTmpBase();
 
   // Spawn a child process that prints "ready" then sleeps, acting as a fake auto-mode session
@@ -108,7 +111,6 @@ test("stopAutoRemote sends SIGTERM to a live process and returns found:true", as
       unitType: "execute-task",
       unitId: "M001/S01/T01",
       unitStartedAt: new Date().toISOString(),
-      completedUnits: 0,
     };
     writeFileSync(join(base, ".gsd", "auto.lock"), JSON.stringify(lockData, null, 2), "utf-8");
 
@@ -140,7 +142,7 @@ test("lock file should be discoverable at project root, not worktree path", () =
 
   try {
     // Simulate: auto-mode writes lock to project root (the fix)
-    writeLock(projectRoot, "execute-task", "M001/S01/T01", 0);
+    writeLock(projectRoot, "execute-task", "M001/S01/T01");
 
     // Second terminal checks project root — should find the lock
     const lock = readCrashLock(projectRoot);

@@ -1,14 +1,14 @@
 # Configuration
 
-GSD preferences live in `~/.gsd/preferences.md` (global) or `.gsd/preferences.md` (project-local). Manage interactively with `/gsd prefs`.
+GSD preferences live in `~/.gsd/PREFERENCES.md` (global) or `.gsd/PREFERENCES.md` (project-local). Manage interactively with `/gsd prefs`.
 
 ## `/gsd prefs` Commands
 
 | Command | Description |
 |---------|-------------|
 | `/gsd prefs` | Open the global preferences wizard (default) |
-| `/gsd prefs global` | Interactive wizard for global preferences (`~/.gsd/preferences.md`) |
-| `/gsd prefs project` | Interactive wizard for project preferences (`.gsd/preferences.md`) |
+| `/gsd prefs global` | Interactive wizard for global preferences (`~/.gsd/PREFERENCES.md`) |
+| `/gsd prefs project` | Interactive wizard for project preferences (`.gsd/PREFERENCES.md`) |
 | `/gsd prefs status` | Show current preference files, merged values, and skill resolution status |
 | `/gsd prefs wizard` | Alias for `/gsd prefs global` |
 | `/gsd prefs setup` | Alias for `/gsd prefs wizard` — creates preferences file if missing |
@@ -42,8 +42,8 @@ token_profile: balanced
 
 | Scope | Path | Applies to |
 |-------|------|-----------|
-| Global | `~/.gsd/preferences.md` | All projects |
-| Project | `.gsd/preferences.md` | Current project only |
+| Global | `~/.gsd/PREFERENCES.md` | All projects |
+| Project | `.gsd/PREFERENCES.md` | Current project only |
 
 **Merge behavior:**
 - **Scalar fields** (`skill_discovery`, `budget_ceiling`): project wins if defined
@@ -155,7 +155,8 @@ Recommended verification order:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GSD_HOME` | `~/.gsd` | Global GSD directory. All paths derive from this unless individually overridden. |
+| `GSD_HOME` | `~/.gsd` | Global GSD directory. All paths derive from this unless individually overridden. Affects preferences, skills, sessions, and per-project state. (v2.39) |
+| `GSD_PROJECT_ID` | (auto-hash) | Override the automatic project identity hash. Per-project state goes to `$GSD_HOME/projects/<GSD_PROJECT_ID>/` instead of the computed hash. Useful for CI/CD or sharing state across clones of the same repo. (v2.39) |
 | `GSD_STATE_DIR` | `$GSD_HOME` | Per-project state root. Controls where `projects/<repo-hash>/` directories are created. Takes precedence over `GSD_HOME` for project state. |
 | `GSD_CODING_AGENT_DIR` | `$GSD_HOME/agent` | Agent directory containing managed resources, extensions, and auth. Takes precedence over `GSD_HOME` for agent paths. |
 
@@ -373,8 +374,8 @@ git:
   auto_push: false            # push commits to remote after committing
   push_branches: false        # push milestone branch to remote
   remote: origin              # git remote name
-  snapshots: false            # WIP snapshot commits during long tasks
-  pre_merge_check: false      # run checks before worktree merge (true/false/"auto")
+  snapshots: true             # WIP snapshot commits during long tasks
+  pre_merge_check: auto       # run checks before worktree merge (true/false/"auto")
   commit_type: feat           # override conventional commit prefix
   main_branch: main           # primary branch name
   merge_strategy: squash      # how worktree branches merge: "squash" or "merge"
@@ -391,8 +392,8 @@ git:
 | `auto_push` | boolean | `false` | Push commits to remote after committing |
 | `push_branches` | boolean | `false` | Push milestone branch to remote |
 | `remote` | string | `"origin"` | Git remote name |
-| `snapshots` | boolean | `false` | WIP snapshot commits during long tasks |
-| `pre_merge_check` | bool/string | `false` | Run checks before merge (`true`/`false`/`"auto"`) |
+| `snapshots` | boolean | `true` | WIP snapshot commits during long tasks |
+| `pre_merge_check` | bool/string | `"auto"` | Run checks before merge (`true`/`false`/`"auto"`) |
 | `commit_type` | string | (inferred) | Override conventional commit prefix (`feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`, `build`, `style`) |
 | `main_branch` | string | `"main"` | Primary branch name |
 | `merge_strategy` | string | `"squash"` | How worktree branches merge: `"squash"` (combine all commits) or `"merge"` (preserve individual commits) |
@@ -451,6 +452,34 @@ git:
 
 If `pr_target_branch` is not set, the PR targets the `main_branch` (or auto-detected main branch). PR creation failure is non-fatal — GSD logs and continues.
 
+### `github` (v2.39)
+
+GitHub sync configuration. When enabled, GSD auto-syncs milestones, slices, and tasks to GitHub Issues, PRs, and Milestones.
+
+```yaml
+github:
+  enabled: true
+  repo: "owner/repo"              # auto-detected from git remote if omitted
+  labels: [gsd, auto-generated]   # labels applied to created issues/PRs
+  project: "Project ID"           # optional GitHub Project board
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable GitHub sync |
+| `repo` | string | (auto-detected) | GitHub repository in `owner/repo` format |
+| `labels` | string[] | `[]` | Labels to apply to created issues and PRs |
+| `project` | string | (none) | GitHub Project ID for project board integration |
+
+**Requirements:**
+- `gh` CLI installed and authenticated (`gh auth login`)
+- Sync mapping is persisted in `.gsd/.github-sync.json`
+- Rate-limit aware — skips sync when GitHub API rate limit is low
+
+**Commands:**
+- `/github-sync bootstrap` — initial setup and sync
+- `/github-sync status` — show sync mapping counts
+
 ### `notifications`
 
 Control what notifications GSD sends during auto mode:
@@ -464,6 +493,14 @@ notifications:
   on_milestone: true          # notify when milestone finishes
   on_attention: true          # notify when manual attention needed
 ```
+
+**macOS delivery:** GSD uses [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) when available, falling back to `osascript`. We recommend installing `terminal-notifier` for reliable notification delivery:
+
+```bash
+brew install terminal-notifier
+```
+
+Why: `osascript display notification` is attributed to your terminal app (Ghostty, iTerm2, etc.), which may not have notification permissions in System Settings → Notifications. `terminal-notifier` registers as its own app and prompts for permission on first use. See [Troubleshooting: Notifications not appearing on macOS](troubleshooting.md#notifications-not-appearing-on-macos) if notifications aren't working.
 
 ### `remote_questions`
 
@@ -549,7 +586,7 @@ prefer_skills:
 avoid_skills: []
 ```
 
-Skills can be bare names (looked up in `~/.gsd/agent/skills/`) or absolute paths.
+Skills can be bare names (looked up in `~/.agents/skills/` and `.agents/skills/`) or absolute paths.
 
 ### `skill_rules`
 
@@ -577,6 +614,32 @@ custom_instructions:
 
 For project-specific knowledge (patterns, gotchas, lessons learned), use `.gsd/KNOWLEDGE.md` instead — it's injected into every agent prompt automatically. Add entries with `/gsd knowledge rule|pattern|lesson <description>`.
 
+### `RUNTIME.md` — Runtime Context (v2.39)
+
+Declare project-level runtime context in `.gsd/RUNTIME.md`. This file is inlined into task execution prompts, giving the agent accurate information about your runtime environment without relying on hallucinated paths or URLs.
+
+**Location:** `.gsd/RUNTIME.md`
+
+**Example:**
+
+```markdown
+# Runtime Context
+
+## API Endpoints
+- Main API: https://api.example.com
+- Cache: redis://localhost:6379
+
+## Environment Variables
+- DEPLOYMENT_ENV: staging
+- DB_POOL_SIZE: 20
+
+## Local Services
+- PostgreSQL: localhost:5432
+- Redis: localhost:6379
+```
+
+Use this for information that the agent needs during execution but that doesn't belong in `DECISIONS.md` (architectural) or `KNOWLEDGE.md` (patterns/rules). Common examples: API base URLs, service ports, deployment targets, and environment-specific configuration.
+
 ### `dynamic_routing`
 
 Complexity-based model routing. See [Dynamic Model Routing](./dynamic-model-routing.md).
@@ -591,6 +654,36 @@ dynamic_routing:
   escalate_on_failure: true
   budget_pressure: true
   cross_provider: true
+```
+
+### `service_tier` (v2.42)
+
+OpenAI service tier preference for supported models. Toggle with `/gsd fast`.
+
+| Value | Behavior |
+|-------|----------|
+| `"priority"` | Priority tier — 2x cost, faster responses |
+| `"flex"` | Flex tier — 0.5x cost, slower responses |
+| (unset) | Default tier |
+
+```yaml
+service_tier: priority
+```
+
+### `forensics_dedup` (v2.43)
+
+Opt-in: search existing issues and PRs before filing from `/gsd forensics`. Uses additional AI tokens.
+
+```yaml
+forensics_dedup: true    # default: false
+```
+
+### `show_token_cost` (v2.44)
+
+Opt-in: show per-prompt and cumulative session token cost in the footer.
+
+```yaml
+show_token_cost: true    # default: false
 ```
 
 ### `auto_visualize`
@@ -678,6 +771,13 @@ notifications:
 
 # Visualizer
 auto_visualize: true
+
+# Service tier
+service_tier: priority         # "priority" or "flex" (for /gsd fast)
+
+# Diagnostics
+forensics_dedup: true          # deduplicate before filing forensics issues
+show_token_cost: true          # show per-prompt cost in footer
 
 # Hooks
 post_unit_hooks:

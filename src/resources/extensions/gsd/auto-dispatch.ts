@@ -12,8 +12,12 @@
 import type { GSDState } from "./types.js";
 import type { GSDPreferences } from "./preferences.js";
 import type { UatType } from "./files.js";
-import { loadFile, extractUatType, loadActiveOverrides, parseRoadmap } from "./files.js";
+import { loadFile, extractUatType, loadActiveOverrides } from "./files.js";
+import { isDbAvailable, getMilestoneSlices, getPendingGates, markAllGatesOmitted, getMilestone } from "./gsd-db.js";
+import { extractVerdict, isAcceptableUatVerdict } from "./verdict-parser.js";
+
 import {
+  gsdRoot,
   resolveMilestoneFile,
   resolveMilestonePath,
   resolveSliceFile,
@@ -23,9 +27,12 @@ import {
   buildMilestoneFileName,
   buildSliceFileName,
 } from "./paths.js";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { logError } from "./workflow-logger.js";
 import { join } from "node:path";
+import { hasImplementationArtifacts } from "./auto-recovery.js";
 import {
+  buildDiscussMilestonePrompt,
   buildResearchMilestonePrompt,
   buildPlanMilestonePrompt,
   buildResearchSlicePrompt,
@@ -39,6 +46,7 @@ import {
   buildReassessRoadmapPrompt,
   buildRewriteDocsPrompt,
   buildReactiveExecutePrompt,
+  buildGateEvaluatePrompt,
   checkNeedsReassessment,
   checkNeedsRunUat,
 } from "./auto-prompts.js";
@@ -52,9 +60,11 @@ export type DispatchAction =
       unitId: string;
       prompt: string;
       pauseAfterDispatch?: boolean;
+      /** Name of the matched dispatch rule from the unified registry (journal provenance). */
+      matchedRule?: string;
     }
-  | { action: "stop"; reason: string; level: "info" | "warning" | "error" }
-  | { action: "skip" };
+  | { action: "stop"; reason: string; level: "info" | "warning" | "error"; matchedRule?: string }
+  | { action: "skip"; matchedRule?: string };
 
 export interface DispatchContext {
   basePath: string;
@@ -65,7 +75,7 @@ export interface DispatchContext {
   session?: import("./auto/session.js").AutoSession;
 }
 
-interface DispatchRule {
+export interface DispatchRule {
   /** Human-readable name for debugging and test identification */
   name: string;
   /** Return a DispatchAction if this rule matches, null to fall through */
@@ -80,26 +90,77 @@ function missingSliceStop(mid: string, phase: string): DispatchAction {
   };
 }
 
+/**
+ * Check for milestone slices missing SUMMARY files.
+ * Returns array of missing slice IDs, or empty array if all present or DB unavailable.
+ */
+function findMissingSummaries(basePath: string, mid: string): string[] {
+  if (!isDbAvailable()) return [];
+  const sliceIds = getMilestoneSlices(mid).map(s => s.id);
+  return sliceIds.filter(sid => {
+    const summaryPath = resolveSliceFile(basePath, mid, sid, "SUMMARY");
+    return !summaryPath || !existsSync(summaryPath);
+  });
+}
+
 // ─── Rewrite Circuit Breaker ──────────────────────────────────────────────
 
 const MAX_REWRITE_ATTEMPTS = 3;
 
+// ─── Disk-persisted rewrite attempt counter ──────────────────────────────────
+// The counter must survive session restarts (crash recovery, pause/resume,
+// step-mode). Storing it on the in-memory session object caused the circuit
+// breaker to never trip — see https://github.com/gsd-build/gsd-2/issues/2203
+function rewriteCountPath(basePath: string): string {
+  return join(gsdRoot(basePath), "runtime", "rewrite-count.json");
+}
+
+export function getRewriteCount(basePath: string): number {
+  try {
+    const data = JSON.parse(readFileSync(rewriteCountPath(basePath), "utf-8"));
+    return typeof data.count === "number" ? data.count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function setRewriteCount(basePath: string, count: number): void {
+  const filePath = rewriteCountPath(basePath);
+  mkdirSync(join(gsdRoot(basePath), "runtime"), { recursive: true });
+  writeFileSync(filePath, JSON.stringify({ count, updatedAt: new Date().toISOString() }) + "\n");
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Returns true when the verification_operational value indicates that no
+ * operational verification is needed.  Covers common phrasings the planning
+ * agent may use: "None", "None required", "N/A", "Not applicable", etc.
+ *
+ * @see https://github.com/gsd-build/gsd-2/issues/2931
+ */
+export function isVerificationNotApplicable(value: string): boolean {
+  const v = (value ?? "").toLowerCase().trim();
+  if (!v || v === "none") return true;
+  return /^(?:none[\s._-]*(?:required|needed|planned)?|n\/?a|not[\s._-]+(?:applicable|required|needed)|no[\s._-]+operational[\s\S]*)$/i.test(v);
+}
+
 // ─── Rules ────────────────────────────────────────────────────────────────
 
-const DISPATCH_RULES: DispatchRule[] = [
+export const DISPATCH_RULES: DispatchRule[] = [
   {
     name: "rewrite-docs (override gate)",
     match: async ({ mid, midTitle, state, basePath, session }) => {
       const pendingOverrides = await loadActiveOverrides(basePath);
       if (pendingOverrides.length === 0) return null;
-      const count = session?.rewriteAttemptCount ?? 0;
+      const count = getRewriteCount(basePath);
       if (count >= MAX_REWRITE_ATTEMPTS) {
         const { resolveAllOverrides } = await import("./files.js");
         await resolveAllOverrides(basePath);
-        if (session) session.rewriteAttemptCount = 0;
+        setRewriteCount(basePath, 0);
         return null;
       }
-      if (session) session.rewriteAttemptCount++;
+      setRewriteCount(basePath, count + 1);
       const unitId = state.activeSlice ? `${mid}/${state.activeSlice.id}` : mid;
       return {
         action: "dispatch",
@@ -155,8 +216,45 @@ const DISPATCH_RULES: DispatchRule[] = [
           uatContent ?? "",
           basePath,
         ),
-        pauseAfterDispatch: uatType !== "artifact-driven" && uatType !== "browser-executable" && uatType !== "runtime-executable",
+        pauseAfterDispatch: !process.env.GSD_HEADLESS && uatType !== "artifact-driven" && uatType !== "browser-executable" && uatType !== "runtime-executable",
       };
+    },
+  },
+  {
+    name: "uat-verdict-gate (non-PASS blocks progression)",
+    match: async ({ mid, basePath, prefs }) => {
+      // Only applies when UAT dispatch is enabled
+      if (!prefs?.uat_dispatch) return null;
+
+      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
+
+      // DB-first: get completed slices from DB
+      let completedSliceIds: string[];
+      if (isDbAvailable()) {
+        completedSliceIds = getMilestoneSlices(mid)
+          .filter(s => s.status === "complete")
+          .map(s => s.id);
+      } else {
+        return null;
+      }
+
+      for (const sliceId of completedSliceIds) {
+        const resultFile = resolveSliceFile(basePath, mid, sliceId, "UAT");
+        if (!resultFile) continue;
+        const content = await loadFile(resultFile);
+        if (!content) continue;
+        const verdict = extractVerdict(content);
+        const uatType = extractUatType(content);
+
+        if (verdict && !isAcceptableUatVerdict(verdict, uatType)) {
+          return {
+            action: "stop" as const,
+            reason: `UAT verdict for ${sliceId} is "${verdict}" — blocking progression until resolved.\nReview the UAT result and update the verdict to PASS, or re-run /gsd auto after fixing.`,
+            level: "warning" as const,
+          };
+        }
+      }
+      return null;
     },
   },
   {
@@ -180,27 +278,29 @@ const DISPATCH_RULES: DispatchRule[] = [
     },
   },
   {
-    name: "needs-discussion → stop",
-    match: async ({ state, mid, midTitle }) => {
+    name: "needs-discussion → discuss-milestone",
+    match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "needs-discussion") return null;
       return {
-        action: "stop",
-        reason: `${mid}: ${midTitle} has draft context from a prior discussion — needs its own discussion before planning.\nRun /gsd to discuss.`,
-        level: "warning",
+        action: "dispatch",
+        unitType: "discuss-milestone",
+        unitId: mid,
+        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
       };
     },
   },
   {
-    name: "pre-planning (no context) → stop",
-    match: async ({ state, mid, basePath }) => {
+    name: "pre-planning (no context) → discuss-milestone",
+    match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "pre-planning") return null;
       const contextFile = resolveMilestoneFile(basePath, mid, "CONTEXT");
       const hasContext = !!(contextFile && (await loadFile(contextFile)));
       if (hasContext) return null; // fall through to next rule
       return {
-        action: "stop",
-        reason: "No context or roadmap yet. Run /gsd to discuss first.",
-        level: "warning",
+        action: "dispatch",
+        unitType: "discuss-milestone",
+        unitId: mid,
+        prompt: await buildDiscussMilestonePrompt(mid, midTitle, basePath),
       };
     },
   },
@@ -278,6 +378,38 @@ const DISPATCH_RULES: DispatchRule[] = [
         unitType: "plan-slice",
         unitId: `${mid}/${sid}`,
         prompt: await buildPlanSlicePrompt(
+          mid,
+          midTitle,
+          sid,
+          sTitle,
+          basePath,
+        ),
+      };
+    },
+  },
+  {
+    name: "evaluating-gates → gate-evaluate",
+    match: async ({ state, mid, midTitle, basePath, prefs }) => {
+      if (state.phase !== "evaluating-gates") return null;
+      if (!state.activeSlice) return missingSliceStop(mid, state.phase);
+      const sid = state.activeSlice.id;
+      const sTitle = state.activeSlice.title;
+
+      // Gate evaluation is opt-in via preferences
+      const gateConfig = prefs?.gate_evaluation;
+      if (!gateConfig?.enabled) {
+        markAllGatesOmitted(mid, sid);
+        return { action: "skip" };
+      }
+
+      const pending = getPendingGates(mid, sid, "slice");
+      if (pending.length === 0) return { action: "skip" };
+
+      return {
+        action: "dispatch",
+        unitType: "gate-evaluate",
+        unitId: `${mid}/${sid}/gates+${pending.map(g => g.gate_id).join(",")}`,
+        prompt: await buildGateEvaluatePrompt(
           mid,
           midTitle,
           sid,
@@ -395,7 +527,7 @@ const DISPATCH_RULES: DispatchRule[] = [
         };
       } catch (err) {
         // Non-fatal — fall through to sequential execution
-        process.stderr.write(`gsd-reactive: graph derivation failed: ${(err as Error).message}\n`);
+        logError("dispatch", "reactive graph derivation failed", { error: (err as Error).message });
         return null;
       }
     },
@@ -464,26 +596,14 @@ const DISPATCH_RULES: DispatchRule[] = [
       if (state.phase !== "validating-milestone") return null;
 
       // Safety guard (#1368): verify all roadmap slices have SUMMARY files before
-      // allowing milestone validation. If any slice lacks a summary, the milestone
-      // is not genuinely complete — something skipped earlier slices.
-      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
-      const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
-        const missingSlices: string[] = [];
-        for (const slice of roadmap.slices) {
-          const summaryPath = resolveSliceFile(basePath, mid, slice.id, "SUMMARY");
-          if (!summaryPath || !existsSync(summaryPath)) {
-            missingSlices.push(slice.id);
-          }
-        }
-        if (missingSlices.length > 0) {
-          return {
-            action: "stop",
-            reason: `Cannot validate milestone ${mid}: slices ${missingSlices.join(", ")} are missing SUMMARY files. These slices may have been skipped.`,
-            level: "error",
-          };
-        }
+      // allowing milestone validation.
+      const missingSlices = findMissingSummaries(basePath, mid);
+      if (missingSlices.length > 0) {
+        return {
+          action: "stop",
+          reason: `Cannot validate milestone ${mid}: slices ${missingSlices.join(", ")} are missing SUMMARY files. These slices may have been skipped.`,
+          level: "error",
+        };
       }
 
       // Skip preference: write a minimal pass-through VALIDATION file
@@ -522,26 +642,77 @@ const DISPATCH_RULES: DispatchRule[] = [
     match: async ({ state, mid, midTitle, basePath }) => {
       if (state.phase !== "completing-milestone") return null;
 
-      // Safety guard (#1368): verify all roadmap slices have SUMMARY files.
-      const roadmapFile = resolveMilestoneFile(basePath, mid, "ROADMAP");
-      const roadmapContent = roadmapFile ? await loadFile(roadmapFile) : null;
-      if (roadmapContent) {
-        const roadmap = parseRoadmap(roadmapContent);
-        const missingSlices: string[] = [];
-        for (const slice of roadmap.slices) {
-          const summaryPath = resolveSliceFile(basePath, mid, slice.id, "SUMMARY");
-          if (!summaryPath || !existsSync(summaryPath)) {
-            missingSlices.push(slice.id);
+      // Safety guard (#2675): block completion when VALIDATION verdict is
+      // needs-remediation. The state machine treats needs-remediation as
+      // terminal (to prevent validate-milestone loops per #832), but
+      // completing-milestone should NOT proceed — remediation work is needed.
+      const validationFile = resolveMilestoneFile(basePath, mid, "VALIDATION");
+      if (validationFile) {
+        const validationContent = await loadFile(validationFile);
+        if (validationContent) {
+          const verdict = extractVerdict(validationContent);
+          if (verdict === "needs-remediation") {
+            return {
+              action: "stop",
+              reason: `Cannot complete milestone ${mid}: VALIDATION verdict is "needs-remediation". Address the remediation findings and re-run validation, or update the verdict manually.`,
+              level: "warning",
+            };
           }
         }
-        if (missingSlices.length > 0) {
-          return {
-            action: "stop",
-            reason: `Cannot complete milestone ${mid}: slices ${missingSlices.join(", ")} are missing SUMMARY files. Run /gsd doctor to diagnose.`,
-            level: "error",
-          };
-        }
       }
+
+      // Safety guard (#1368): verify all roadmap slices have SUMMARY files.
+      const missingSlices = findMissingSummaries(basePath, mid);
+      if (missingSlices.length > 0) {
+        return {
+          action: "stop",
+          reason: `Cannot complete milestone ${mid}: slices ${missingSlices.join(", ")} are missing SUMMARY files. Run /gsd doctor to diagnose.`,
+          level: "error",
+        };
+      }
+
+      // Safety guard (#1703): verify the milestone produced implementation
+      // artifacts (non-.gsd/ files). A milestone with only plan files and
+      // zero implementation code should not be marked complete.
+      if (!hasImplementationArtifacts(basePath)) {
+        return {
+          action: "stop",
+          reason: `Cannot complete milestone ${mid}: no implementation files found outside .gsd/. The milestone has only plan files — actual code changes are required.`,
+          level: "error",
+        };
+      }
+
+      // Verification class compliance: if operational verification was planned,
+      // ensure the validation output documents it before allowing completion.
+      try {
+        if (isDbAvailable()) {
+          const milestone = getMilestone(mid);
+          if (milestone?.verification_operational &&
+              !isVerificationNotApplicable(milestone.verification_operational)) {
+            const validationPath = resolveMilestoneFile(basePath, mid, "VALIDATION");
+            if (validationPath) {
+              const validationContent = await loadFile(validationPath);
+              if (validationContent) {
+                // Accept either the structured template format (table with MET/N/A/SATISFIED)
+                // or prose evidence patterns the validation agent may emit.
+                const structuredMatch =
+                  validationContent.includes("Operational") &&
+                  (validationContent.includes("MET") || validationContent.includes("N/A") || validationContent.includes("SATISFIED"));
+                const proseMatch =
+                  /[Oo]perational[\s\S]{0,500}?(?:✅|pass|verified|confirmed|met|complete|true|yes|addressed|covered|satisfied|partially|n\/a|not[\s-]+applicable)/i.test(validationContent);
+                const hasOperationalCheck = structuredMatch || proseMatch;
+                if (!hasOperationalCheck) {
+                  return {
+                    action: "stop" as const,
+                    reason: `Milestone ${mid} has planned operational verification ("${milestone.verification_operational.substring(0, 100)}") but the validation output does not address it. Re-run validation with verification class awareness, or update the validation to document operational compliance.`,
+                    level: "warning" as const,
+                  };
+                }
+              }
+            }
+          }
+        }
+      } catch { /* fall through — don't block on DB errors */ }
 
       return {
         action: "dispatch",
@@ -564,18 +735,35 @@ const DISPATCH_RULES: DispatchRule[] = [
   },
 ];
 
+import { getRegistry } from "./rule-registry.js";
+
 // ─── Resolver ─────────────────────────────────────────────────────────────
 
 /**
  * Evaluate dispatch rules in order. Returns the first matching action,
  * or a "stop" action if no rule matches (unhandled phase).
+ *
+ * Delegates to the RuleRegistry when initialized; falls back to inline
+ * loop over DISPATCH_RULES for backward compatibility (tests that import
+ * resolveDispatch directly without registry initialization).
  */
 export async function resolveDispatch(
   ctx: DispatchContext,
 ): Promise<DispatchAction> {
+  // Delegate to registry when available
+  try {
+    const registry = getRegistry();
+    return await registry.evaluateDispatch(ctx);
+  } catch {
+    // Registry not initialized — fall back to inline loop
+  }
+
   for (const rule of DISPATCH_RULES) {
     const result = await rule.match(ctx);
-    if (result) return result;
+    if (result) {
+      if (result.action !== "skip") result.matchedRule = rule.name;
+      return result;
+    }
   }
 
   // No rule matched — unhandled phase
@@ -583,6 +771,7 @@ export async function resolveDispatch(
     action: "stop",
     reason: `Unhandled phase "${ctx.state.phase}" — run /gsd doctor to diagnose.`,
     level: "info",
+    matchedRule: "<no-match>",
   };
 }
 

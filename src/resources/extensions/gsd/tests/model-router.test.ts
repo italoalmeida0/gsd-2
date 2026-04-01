@@ -165,3 +165,108 @@ test("falls back to configured model when no light-tier model available", () => 
   assert.equal(result.modelId, "claude-opus-4-6");
   assert.equal(result.wasDowngraded, false);
 });
+
+// ─── #2192: Unknown models honor explicit config ─────────────────────────────
+
+test("#2192: unknown model is not downgraded — respects user config", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const result = resolveModelForComplexity(
+    makeClassification("light"),
+    { primary: "some-future-unknown-model-v9", fallbacks: [] },
+    config,
+    ["some-future-unknown-model-v9", ...AVAILABLE_MODELS],
+  );
+  assert.equal(result.modelId, "some-future-unknown-model-v9", "unknown model should be used as-is");
+  assert.equal(result.wasDowngraded, false, "should not be downgraded");
+  assert.ok(result.reason.includes("not in the known tier map"), "reason should explain why");
+});
+
+test("#2192: unknown model with provider prefix is not downgraded", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const result = resolveModelForComplexity(
+    makeClassification("standard"),
+    { primary: "custom-provider/my-model-v3", fallbacks: [] },
+    config,
+    ["custom-provider/my-model-v3", ...AVAILABLE_MODELS],
+  );
+  assert.equal(result.modelId, "custom-provider/my-model-v3");
+  assert.equal(result.wasDowngraded, false);
+});
+
+test("#2192: known model is still downgraded normally", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  // claude-opus-4-6 is known as "heavy" — a light request should downgrade
+  const result = resolveModelForComplexity(
+    makeClassification("light"),
+    { primary: "claude-opus-4-6", fallbacks: [] },
+    config,
+    AVAILABLE_MODELS,
+  );
+  assert.equal(result.wasDowngraded, true, "known heavy model should still be downgraded for light tasks");
+  assert.notEqual(result.modelId, "claude-opus-4-6");
+});
+
+// ─── #2885: openai-codex and modern OpenAI models in tier map ────────────────
+
+test("#2885: openai-codex light-tier models are recognized", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const lightModels = ["gpt-4.1-mini", "gpt-4.1-nano", "gpt-5-mini", "gpt-5-nano", "gpt-5.1-codex-mini", "gpt-5.3-codex-spark"];
+  for (const model of lightModels) {
+    const result = resolveModelForComplexity(
+      makeClassification("light"),
+      { primary: model, fallbacks: [] },
+      config,
+      [model, ...AVAILABLE_MODELS],
+    );
+    // Model is known AND light-tier, so requesting light should NOT downgrade
+    assert.equal(result.wasDowngraded, false, `${model} should be known as light tier (wasDowngraded)`);
+    assert.equal(result.modelId, model, `${model} should be returned as-is for light tier`);
+    // Verify it IS known (not hitting the unknown-model bail-out)
+    assert.ok(!result.reason.includes("not in the known tier map"), `${model} should be in the known tier map`);
+  }
+});
+
+test("#2885: openai-codex standard-tier models are recognized", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const standardModels = ["gpt-4.1", "gpt-5.1-codex-max"];
+  for (const model of standardModels) {
+    const result = resolveModelForComplexity(
+      makeClassification("standard"),
+      { primary: model, fallbacks: [] },
+      config,
+      [model, ...AVAILABLE_MODELS],
+    );
+    assert.equal(result.wasDowngraded, false, `${model} should be known as standard tier`);
+    assert.equal(result.modelId, model, `${model} should be returned as-is for standard tier`);
+    assert.ok(!result.reason.includes("not in the known tier map"), `${model} should be in the known tier map`);
+  }
+});
+
+test("#2885: openai-codex heavy-tier models are recognized", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const heavyModels = ["gpt-5", "gpt-5-pro", "gpt-5.1", "gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.4", "o4-mini", "o4-mini-deep-research"];
+  for (const model of heavyModels) {
+    const result = resolveModelForComplexity(
+      makeClassification("heavy"),
+      { primary: model, fallbacks: [] },
+      config,
+      [model, ...AVAILABLE_MODELS],
+    );
+    assert.equal(result.wasDowngraded, false, `${model} should be known as heavy tier`);
+    assert.equal(result.modelId, model, `${model} should be returned as-is for heavy tier`);
+    assert.ok(!result.reason.includes("not in the known tier map"), `${model} should be in the known tier map`);
+  }
+});
+
+test("#2885: heavy openai-codex model downgrades to light for light task", () => {
+  const config = { ...defaultRoutingConfig(), enabled: true };
+  const result = resolveModelForComplexity(
+    makeClassification("light"),
+    { primary: "gpt-5.4", fallbacks: [] },
+    config,
+    ["gpt-5.4", "gpt-4.1-nano", ...AVAILABLE_MODELS],
+  );
+  assert.equal(result.wasDowngraded, true, "heavy model should downgrade for light task");
+  // Should pick a light-tier model
+  assert.notEqual(result.modelId, "gpt-5.4", "should not use the heavy model for light task");
+});

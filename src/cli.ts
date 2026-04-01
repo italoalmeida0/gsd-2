@@ -2,6 +2,7 @@ import {
   AuthStorage,
   DefaultResourceLoader,
   ModelRegistry,
+  runPackageCommand,
   SettingsManager,
   SessionManager,
   createAgentSession,
@@ -9,18 +10,37 @@ import {
   runPrintMode,
   runRpcMode,
 } from '@gsd/pi-coding-agent'
-import { existsSync, readdirSync, renameSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { agentDir, sessionsDir, authFilePath } from './app-paths.js'
 import { initResources, buildResourceLoader, getNewerManagedResourceVersion } from './resource-loader.js'
 import { ensureManagedTools } from './tool-bootstrap.js'
 import { loadStoredEnvKeys } from './wizard.js'
-import { getPiDefaultModelAndProvider, migratePiCredentials } from './pi-migration.js'
+import { migratePiCredentials } from './pi-migration.js'
+import { validateConfiguredModel } from './startup-model-validation.js'
 import { shouldRunOnboarding, runOnboarding } from './onboarding.js'
 import chalk from 'chalk'
 import { checkForUpdates } from './update-check.js'
 import { printHelp, printSubcommandHelp } from './help-text.js'
+import {
+  parseCliArgs as parseWebCliArgs,
+  runWebCliBranch,
+  migrateLegacyFlatSessions,
+} from './cli-web-branch.js'
+import { stopWebMode } from './web-mode.js'
+import { getProjectSessionsDir } from './project-sessions.js'
 import { markStartup, printStartupTimings } from './startup-timings.js'
+import { bootstrapRtk, GSD_RTK_DISABLED_ENV } from './rtk.js'
+import { loadEffectiveGSDPreferences } from './resources/extensions/gsd/preferences.js'
+
+// ---------------------------------------------------------------------------
+// V8 compile cache — Node 22+ can cache compiled bytecode across runs,
+// eliminating repeated parse/compile overhead for unchanged modules.
+// Must be set early so dynamic imports (extensions, lazy subcommands) benefit.
+// ---------------------------------------------------------------------------
+if (parseInt(process.versions.node) >= 22) {
+  process.env.NODE_COMPILE_CACHE ??= join(agentDir, '.compile-cache')
+}
 
 // ---------------------------------------------------------------------------
 // Minimal CLI arg parser — detects print/subagent mode flags
@@ -37,6 +57,9 @@ interface CliFlags {
   appendSystemPrompt?: string
   tools?: string[]
   messages: string[]
+  web?: boolean
+  webPath?: string
+
   /** Set by `gsd sessions` when the user picks a specific session to resume */
   _selectedSessionPath?: string
 }
@@ -93,6 +116,12 @@ function parseCliArgs(argv: string[]): CliFlags {
     } else if (arg === '--help' || arg === '-h') {
       printHelp(process.env.GSD_VERSION || '0.0.0')
       process.exit(0)
+    } else if (arg === '--web') {
+      flags.web = true
+      // Capture optional project path after --web (not a flag)
+      if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+        flags.webPath = args[++i]
+      }
     } else if (!arg.startsWith('--') && !arg.startsWith('-')) {
       flags.messages.push(arg)
     }
@@ -105,14 +134,44 @@ const isPrintMode = cliFlags.print || cliFlags.mode !== undefined
 
 // Early resource-skew check — must run before TTY gate so version mismatch
 // errors surface even in non-TTY environments.
+async function ensureRtkBootstrap(): Promise<void> {
+  if ((ensureRtkBootstrap as { _done?: boolean })._done) return
+
+  // RTK is opt-in via experimental.rtk preference. Default: disabled.
+  // Honor GSD_RTK_DISABLED if already explicitly set in the environment
+  // (env var takes precedence over preferences for manual override).
+  if (!process.env[GSD_RTK_DISABLED_ENV]) {
+    const prefs = loadEffectiveGSDPreferences();
+    const rtkEnabled = prefs?.preferences.experimental?.rtk === true;
+    if (!rtkEnabled) {
+      process.env[GSD_RTK_DISABLED_ENV] = "1";
+    }
+  }
+
+  const rtkStatus = await bootstrapRtk()
+  ;(ensureRtkBootstrap as { _done?: boolean })._done = true
+  markStartup('bootstrapRtk')
+  if (!rtkStatus.available && rtkStatus.supported && rtkStatus.enabled && rtkStatus.reason) {
+    process.stderr.write(`[gsd] Warning: RTK unavailable — continuing without shell-command compression (${rtkStatus.reason}).\n`)
+  }
+}
+
+// `gsd update` — update to the latest version via npm
+if (cliFlags.messages[0] === 'update') {
+  const { runUpdate } = await import('./update-cmd.js')
+  await runUpdate()
+  process.exit(0)
+}
+
 exitIfManagedResourcesAreNewer(agentDir)
 
 // Early TTY check — must come before heavy initialization to avoid dangling
 // handles that prevent process.exit() from completing promptly.
 const hasSubcommand = cliFlags.messages.length > 0
-if (!process.stdin.isTTY && !isPrintMode && !hasSubcommand && !cliFlags.listModels) {
+if (!process.stdin.isTTY && !isPrintMode && !hasSubcommand && !cliFlags.listModels && !cliFlags.web) {
   process.stderr.write('[gsd] Error: Interactive mode requires a terminal (TTY).\n')
   process.stderr.write('[gsd] Non-interactive alternatives:\n')
+  process.stderr.write('[gsd]   gsd auto                       Auto-mode (pipeable, no TUI)\n')
   process.stderr.write('[gsd]   gsd --print "your message"     Single-shot prompt\n')
   process.stderr.write('[gsd]   gsd --mode rpc                 JSON-RPC over stdin/stdout\n')
   process.stderr.write('[gsd]   gsd --mode mcp                 MCP server over stdin/stdout\n')
@@ -128,6 +187,19 @@ if (subcommand && process.argv.includes('--help')) {
   }
 }
 
+const packageCommand = await runPackageCommand({
+  appName: 'gsd',
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  agentDir,
+  stdout: process.stdout,
+  stderr: process.stderr,
+  allowedCommands: new Set(['install', 'remove', 'list']),
+})
+if (packageCommand.handled) {
+  process.exit(packageCommand.exitCode)
+}
+
 // `gsd config` — replay the setup wizard and exit
 if (cliFlags.messages[0] === 'config') {
   const authStorage = AuthStorage.create(authFilePath)
@@ -136,12 +208,34 @@ if (cliFlags.messages[0] === 'config') {
   process.exit(0)
 }
 
-// `gsd update` — update to the latest version via npm
-if (cliFlags.messages[0] === 'update') {
-  const { runUpdate } = await import('./update-cmd.js')
-  await runUpdate()
-  process.exit(0)
+// `gsd web stop [path|all]` — stop web server before anything else
+if (cliFlags.messages[0] === 'web' && cliFlags.messages[1] === 'stop') {
+  const webFlags = parseWebCliArgs(process.argv)
+  const webBranch = await runWebCliBranch(webFlags, {
+    stopWebMode,
+    stderr: process.stderr,
+    baseSessionsDir: sessionsDir,
+    agentDir,
+  })
+  if (webBranch.handled) {
+    process.exit(webBranch.exitCode)
+  }
 }
+
+// `gsd --web [path]` or `gsd web [start] [path]` — launch browser-only web mode
+if (cliFlags.web || (cliFlags.messages[0] === 'web' && cliFlags.messages[1] !== 'stop')) {
+  await ensureRtkBootstrap()
+  const webFlags = parseWebCliArgs(process.argv)
+  const webBranch = await runWebCliBranch(webFlags, {
+    stderr: process.stderr,
+    baseSessionsDir: sessionsDir,
+    agentDir,
+  })
+  if (webBranch.handled) {
+    process.exit(webBranch.exitCode)
+  }
+}
+
 
 // `gsd sessions` — list past sessions and pick one to resume
 if (cliFlags.messages[0] === 'sessions') {
@@ -202,8 +296,26 @@ if (cliFlags.messages[0] === 'sessions') {
 
 // `gsd headless` — run auto-mode without TUI
 if (cliFlags.messages[0] === 'headless') {
+  await ensureRtkBootstrap()
   const { runHeadless, parseHeadlessArgs } = await import('./headless.js')
   await runHeadless(parseHeadlessArgs(process.argv))
+  process.exit(0)
+}
+
+// `gsd auto [args...]` — shorthand for `gsd headless auto [args...]` (#2732)
+// Without this, `gsd auto` falls through to the interactive TUI which hangs
+// when stdin/stdout are piped (non-TTY environments).
+if (cliFlags.messages[0] === 'auto') {
+  await ensureRtkBootstrap()
+  const { runHeadless, parseHeadlessArgs } = await import('./headless.js')
+  // Rewrite argv so parseHeadlessArgs sees: [node, gsd, headless, auto, ...rest]
+  const rewrittenArgv = [
+    process.argv[0],
+    process.argv[1],
+    'headless',
+    ...cliFlags.messages,   // ['auto', ...extra args]
+  ]
+  await runHeadless(parseHeadlessArgs(rewrittenArgv))
   process.exit(0)
 }
 
@@ -298,42 +410,6 @@ if (cliFlags.listModels !== undefined) {
   process.exit(0)
 }
 
-// Validate configured model on startup — catches stale settings from prior installs
-// (e.g. grok-2 which no longer exists) and fresh installs with no settings.
-// Only resets the default when the configured model no longer exists in the registry;
-// never overwrites a valid user choice.
-const configuredProvider = settingsManager.getDefaultProvider()
-const configuredModel = settingsManager.getDefaultModel()
-const allModels = modelRegistry.getAll()
-const availableModels = modelRegistry.getAvailable()
-const configuredExists = configuredProvider && configuredModel &&
-  allModels.some((m) => m.provider === configuredProvider && m.id === configuredModel)
-const configuredAvailable = configuredProvider && configuredModel &&
-  availableModels.some((m) => m.provider === configuredProvider && m.id === configuredModel)
-
-if (!configuredModel || !configuredExists) {
-  // Model not configured at all, or removed from registry — pick a fallback.
-  // Only fires when the model is genuinely unknown (not just temporarily unavailable).
-  const piDefault = getPiDefaultModelAndProvider()
-  const preferred =
-    (piDefault
-      ? availableModels.find((m) => m.provider === piDefault.provider && m.id === piDefault.model)
-      : undefined) ||
-    availableModels.find((m) => m.provider === 'openai' && m.id === 'gpt-5.4') ||
-    availableModels.find((m) => m.provider === 'openai') ||
-    availableModels.find((m) => m.provider === 'anthropic' && m.id === 'claude-opus-4-6') ||
-    availableModels.find((m) => m.provider === 'anthropic' && m.id.includes('opus')) ||
-    availableModels.find((m) => m.provider === 'anthropic') ||
-    availableModels[0]
-  if (preferred) {
-    settingsManager.setDefaultModelAndProvider(preferred.provider, preferred.id)
-  }
-}
-
-if (settingsManager.getDefaultThinkingLevel() !== 'off' && !configuredExists) {
-  settingsManager.setDefaultThinkingLevel('off')
-}
-
 // GSD always uses quiet startup — the gsd extension renders its own branded header
 if (!settingsManager.getQuietStartup()) {
   settingsManager.setQuietStartup(true)
@@ -348,6 +424,7 @@ if (!settingsManager.getCollapseChangelog()) {
 // Print / subagent mode — single-shot execution, no TTY required
 // ---------------------------------------------------------------------------
 if (isPrintMode) {
+  await ensureRtkBootstrap()
   const sessionManager = cliFlags.noSession
     ? SessionManager.inMemory()
     : SessionManager.create(process.cwd())
@@ -382,6 +459,11 @@ if (isPrintMode) {
     resourceLoader,
   })
   markStartup('createAgentSession')
+
+  // Validate configured model AFTER extensions have registered their models (#2626).
+  // Before this, extension-provided models (e.g. claude-code/*) were not yet in the
+  // registry, causing the user's valid choice to be silently overwritten.
+  validateConfiguredModel(modelRegistry, settingsManager)
 
   if (extensionsResult.errors.length > 0) {
     for (const err of extensionsResult.errors) {
@@ -472,37 +554,34 @@ if (!cliFlags.worktree && !isPrintMode) {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-redirect: `gsd auto` with piped stdout → headless mode (#2732)
+// When stdout is not a TTY (e.g. `gsd auto | cat`, `gsd auto > file`),
+// the TUI cannot render and the process hangs. Redirect to headless mode
+// which handles non-interactive output gracefully.
+// ---------------------------------------------------------------------------
+if (cliFlags.messages[0] === 'auto' && !process.stdout.isTTY) {
+  await ensureRtkBootstrap()
+  const { runHeadless, parseHeadlessArgs } = await import('./headless.js')
+  process.stderr.write('[gsd] stdout is not a terminal — running auto-mode in headless mode.\n')
+  await runHeadless(parseHeadlessArgs(['node', 'gsd', 'headless', ...cliFlags.messages.slice(1)]))
+  process.exit(0)
+}
+
+// ---------------------------------------------------------------------------
 // Interactive mode — normal TTY session
 // ---------------------------------------------------------------------------
+
+await ensureRtkBootstrap()
 
 // Per-directory session storage — same encoding as the upstream SDK so that
 // /resume only shows sessions from the current working directory.
 const cwd = process.cwd()
-const safePath = `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`
-const projectSessionsDir = join(sessionsDir, safePath)
+const projectSessionsDir = getProjectSessionsDir(cwd)
 
 // Migrate legacy flat sessions: before per-directory scoping, all .jsonl session
 // files lived directly in ~/.gsd/sessions/. Move them into the correct per-cwd
 // subdirectory so /resume can find them.
-if (existsSync(sessionsDir)) {
-  try {
-    const entries = readdirSync(sessionsDir)
-    const flatJsonl = entries.filter(f => f.endsWith('.jsonl'))
-    if (flatJsonl.length > 0) {
-      const { mkdirSync } = await import('node:fs')
-      mkdirSync(projectSessionsDir, { recursive: true })
-      for (const file of flatJsonl) {
-        const src = join(sessionsDir, file)
-        const dst = join(projectSessionsDir, file)
-        if (!existsSync(dst)) {
-          renameSync(src, dst)
-        }
-      }
-    }
-  } catch {
-    // Non-fatal — don't block startup if migration fails
-  }
-}
+migrateLegacyFlatSessions(sessionsDir, projectSessionsDir)
 
 const sessionManager = cliFlags._selectedSessionPath
   ? SessionManager.open(cliFlags._selectedSessionPath, projectSessionsDir)
@@ -513,8 +592,16 @@ const sessionManager = cliFlags._selectedSessionPath
 exitIfManagedResourcesAreNewer(agentDir)
 initResources(agentDir)
 markStartup('initResources')
+
+// Overlap resource loading with session manager setup — both are independent.
+// resourceLoader.reload() is the most expensive step (jiti compilation), so
+// starting it early shaves ~50-200ms off interactive startup.
 const resourceLoader = buildResourceLoader(agentDir)
-await resourceLoader.reload()
+const resourceLoadPromise = resourceLoader.reload()
+
+// While resources load, let session manager finish any async I/O it needs.
+// Then await the resource promise before creating the agent session.
+await resourceLoadPromise
 markStartup('resourceLoader.reload')
 
 const { session, extensionsResult } = await createAgentSession({
@@ -525,6 +612,11 @@ const { session, extensionsResult } = await createAgentSession({
   resourceLoader,
 })
 markStartup('createAgentSession')
+
+// Validate configured model AFTER extensions have registered their models (#2626).
+// Before this, extension-provided models (e.g. claude-code/*) were not yet in the
+// registry, causing the user's valid choice to be silently overwritten.
+validateConfiguredModel(modelRegistry, settingsManager)
 
 if (extensionsResult.errors.length > 0) {
   for (const err of extensionsResult.errors) {
@@ -577,13 +669,39 @@ if (enabledModelPatterns && enabledModelPatterns.length > 0) {
   }
 }
 
-// Welcome screen — shown on every fresh interactive session before TUI takes over
-{
+if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  const missing = !process.stdin.isTTY && !process.stdout.isTTY
+    ? 'stdin and stdout are'
+    : !process.stdin.isTTY
+      ? 'stdin is'
+      : 'stdout is'
+  process.stderr.write(`[gsd] Error: Interactive mode requires a terminal (TTY) but ${missing} not a TTY.\n`)
+  process.stderr.write('[gsd] Non-interactive alternatives:\n')
+  process.stderr.write('[gsd]   gsd auto                       Auto-mode (pipeable, no TUI)\n')
+  process.stderr.write('[gsd]   gsd --print "your message"     Single-shot prompt\n')
+  process.stderr.write('[gsd]   gsd --web [path]               Browser-only web mode\n')
+  process.stderr.write('[gsd]   gsd --mode rpc                 JSON-RPC over stdin/stdout\n')
+  process.stderr.write('[gsd]   gsd --mode mcp                 MCP server over stdin/stdout\n')
+  process.stderr.write('[gsd]   gsd --mode text "message"      Text output mode\n')
+  process.stderr.write('[gsd]   gsd headless                   Auto-mode without TUI\n')
+  process.exit(1)
+}
+
+// Welcome screen — shown on every fresh interactive session before TUI takes over.
+// Skip when the first-run banner was already printed in loader.ts (prevents double banner).
+if (!process.env.GSD_FIRST_RUN_BANNER) {
   const { printWelcomeScreen } = await import('./welcome-screen.js')
+  let remoteChannel: string | undefined
+  try {
+    const { resolveRemoteConfig } = await import('./resources/extensions/remote-questions/config.js')
+    const rc = resolveRemoteConfig()
+    if (rc) remoteChannel = rc.channel
+  } catch { /* non-fatal */ }
   printWelcomeScreen({
     version: process.env.GSD_VERSION || '0.0.0',
     modelName: settingsManager.getDefaultModel() || undefined,
     provider: settingsManager.getDefaultProvider() || undefined,
+    remoteChannel,
   })
 }
 

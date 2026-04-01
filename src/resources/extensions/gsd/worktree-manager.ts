@@ -15,9 +15,11 @@
  *   4. remove()  — git worktree remove + branch cleanup
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, resolve, sep } from "node:path";
 import { GSDError, GSD_PARSE_ERROR, GSD_STALE_STATE, GSD_LOCK_HELD, GSD_GIT_ERROR, GSD_MERGE_CONFLICT } from "./errors.js";
+import { logWarning } from "./workflow-logger.js";
 import {
   nativeBranchDelete,
   nativeBranchExists,
@@ -129,7 +131,17 @@ export function createWorktree(basePath: string, name: string, opts: { branch?: 
   const branch = opts.branch ?? worktreeBranchName(name);
 
   if (existsSync(wtPath)) {
-    throw new GSDError(GSD_STALE_STATE, `Worktree "${name}" already exists at ${wtPath}`);
+    // A valid git worktree has a .git file (not directory) containing a
+    // "gitdir:" pointer.  If the directory exists but has no .git file,
+    // it is a stale leftover from a prior crash — remove it so a fresh
+    // worktree can be created in its place.
+    const gitFilePath = join(wtPath, ".git");
+    if (!existsSync(gitFilePath)) {
+      logWarning("reconcile", `Removing stale worktree directory (no .git file): ${wtPath}`, { worktree: name });
+      rmSync(wtPath, { recursive: true, force: true });
+    } else {
+      throw new GSDError(GSD_STALE_STATE, `Worktree "${name}" already exists at ${wtPath}`);
+    }
   }
 
   // Ensure the .gsd/worktrees/ directory exists
@@ -265,6 +277,78 @@ export function listWorktrees(basePath: string): WorktreeInfo[] {
   return worktrees;
 }
 
+// ─── Nested .git Detection (#2616) ──────────────────────────────────────
+//
+// Scaffolding tools (create-next-app, cargo init, etc.) create nested .git
+// directories inside worktrees. Git records these as gitlinks (mode 160000)
+// without a .gitmodules entry — so worktree cleanup destroys the only copy
+// of their object database, causing permanent silent data loss.
+
+/** Directories to skip when scanning for nested .git dirs. */
+const NESTED_GIT_SKIP_DIRS = new Set([
+  ".git", ".gsd", "node_modules", ".next", ".nuxt", "dist", "build",
+  "__pycache__", ".tox", ".venv", "venv", "target", "vendor",
+]);
+
+/**
+ * Recursively find nested .git directories inside a worktree root.
+ * Returns paths to directories that contain their own .git (directory, not file).
+ * Skips node_modules, .gsd, and other non-project directories for performance.
+ *
+ * A nested .git *directory* (not a .git file — which is a legitimate worktree
+ * pointer) indicates a scaffolded repo that will become an orphaned gitlink.
+ */
+export function findNestedGitDirs(rootPath: string): string[] {
+  const results: string[] = [];
+
+  function walk(dir: string, depth: number): void {
+    // Cap recursion depth to avoid runaway scanning
+    if (depth > 10) return;
+
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return; // Permission denied, broken symlink, etc.
+    }
+
+    for (const entry of entries) {
+      if (NESTED_GIT_SKIP_DIRS.has(entry)) continue;
+
+      const fullPath = join(dir, entry);
+
+      // Only follow real directories, not symlinks
+      let stat;
+      try {
+        stat = lstatSync(fullPath);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+
+      // Check if this directory contains a .git *directory* (not a .git file).
+      // A .git file is a worktree pointer and is legitimate.
+      // A .git directory is a standalone repo created by scaffolding.
+      const innerGit = join(fullPath, ".git");
+      try {
+        const innerStat = lstatSync(innerGit);
+        if (innerStat.isDirectory()) {
+          results.push(fullPath);
+          // Don't recurse into the nested repo — we found what we need
+          continue;
+        }
+      } catch {
+        // No .git here — continue scanning
+      }
+
+      walk(fullPath, depth + 1);
+    }
+  }
+
+  walk(rootPath, 0);
+  return results;
+}
+
 /**
  * Remove a worktree and optionally delete its branch.
  * If the process is currently inside the worktree, chdir out first.
@@ -274,10 +358,25 @@ export function removeWorktree(
   name: string,
   opts: { deleteBranch?: boolean; force?: boolean; branch?: string } = {},
 ): void {
-  const wtPath = worktreePath(basePath, name);
-  const resolvedWtPath = existsSync(wtPath) ? realpathSync(wtPath) : wtPath;
+  let wtPath = worktreePath(basePath, name);
   const branch = opts.branch ?? worktreeBranchName(name);
   const { deleteBranch = true, force = true } = opts;
+
+  // Resolve the ACTUAL worktree path from git's worktree list.
+  // The computed path may differ when .gsd/ is (or was) a symlink to an
+  // external state directory — git resolves symlinks at worktree creation
+  // time, so its registered path points to the resolved external location.
+  // If syncStateToProjectRoot later creates a real .gsd/ directory that
+  // shadows the symlink, the computed path diverges from git's record.
+  try {
+    const entries = nativeWorktreeList(basePath);
+    const entry = entries.find(e => e.branch === branch);
+    if (entry?.path) {
+      wtPath = entry.path;
+    }
+  } catch { /* fall back to computed path */ }
+
+  const resolvedWtPath = existsSync(wtPath) ? realpathSync(wtPath) : wtPath;
 
   // If we're inside the worktree, move out first — git can't remove an in-use directory
   const cwd = process.cwd();
@@ -294,12 +393,95 @@ export function removeWorktree(
     return;
   }
 
-  // Remove worktree (force if requested, to handle dirty worktrees)
-  try { nativeWorktreeRemove(basePath, wtPath, force); } catch { /* may fail */ }
+  // Submodule safety (#2337): detect submodules with uncommitted changes
+  // before force-removing the worktree. Force removal destroys all uncommitted
+  // state, which is especially destructive for submodule directories.
+  let hasSubmoduleChanges = false;
+  const gitmodulesPath = join(resolvedWtPath, ".gitmodules");
+  if (existsSync(gitmodulesPath)) {
+    try {
+      const submoduleStatus = execFileSync(
+        "git", ["submodule", "status"], 
+        { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+      ).trim();
+      // Lines starting with '+' indicate uncommitted submodule changes
+      hasSubmoduleChanges = submoduleStatus.split("\n").some(
+        (line: string) => line.startsWith("+") || line.startsWith("-"),
+      );
+      if (hasSubmoduleChanges) {
+        // Stash submodule changes so they are not lost during force removal.
+        // The stash is created in the worktree before it's torn down.
+        try {
+          execFileSync(
+            "git", ["stash", "push", "-m", "gsd: auto-stash submodule changes before worktree teardown"],
+            { cwd: resolvedWtPath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+          );
+          logWarning("reconcile", `Stashed uncommitted submodule changes before worktree teardown`, { worktree: name, path: resolvedWtPath });
+        } catch {
+          // Stash failed — warn the user that submodule changes may be lost
+          logWarning("reconcile", `Submodule changes detected — stash failed, changes may be lost during force removal`, { worktree: name, path: resolvedWtPath });
+        }
+      }
+    } catch {
+      // submodule status failed — proceed with normal removal
+    }
+  }
+
+  // Nested .git safety (#2616): detect nested .git directories created by
+  // scaffolding tools (create-next-app, cargo init, etc.). These produce
+  // gitlink entries (mode 160000) without .gitmodules — cleanup would destroy
+  // the only copy of the nested object database, causing permanent data loss.
+  // Fix: remove the nested .git dirs so git tracks the files as regular content.
+  const nestedGitDirs = findNestedGitDirs(resolvedWtPath);
+  if (nestedGitDirs.length > 0) {
+    for (const nestedDir of nestedGitDirs) {
+      const nestedGitPath = join(nestedDir, ".git");
+      try {
+        rmSync(nestedGitPath, { recursive: true, force: true });
+        logWarning("reconcile",
+          `Removed nested .git directory from scaffolded project to prevent data loss (#2616)`,
+          { worktree: name, nestedRepo: nestedDir },
+        );
+      } catch {
+        logWarning("reconcile",
+          `Failed to remove nested .git directory — files may be lost as orphaned gitlink`,
+          { worktree: name, nestedRepo: nestedDir },
+        );
+      }
+    }
+  }
+
+  // Remove worktree: try non-force first when submodules have changes,
+  // falling back to force only after submodule state has been preserved.
+  const useForce = hasSubmoduleChanges ? false : force;
+  try { nativeWorktreeRemove(basePath, resolvedWtPath, useForce); } catch { /* may fail */ }
 
   // If the directory is still there (e.g. locked), try harder with force
-  if (existsSync(wtPath)) {
-    try { nativeWorktreeRemove(basePath, wtPath, true); } catch { /* may fail */ }
+  if (existsSync(resolvedWtPath)) {
+    try { nativeWorktreeRemove(basePath, resolvedWtPath, true); } catch { /* may fail */ }
+  }
+
+  // (#2821) If the worktree directory STILL exists after both native removal
+  // attempts (e.g. untracked files like ASSESSMENT/UAT-RESULT prevent git
+  // worktree remove), force-remove the git internal worktree metadata first,
+  // then remove the filesystem directory. Without this, the .git/worktrees/<name>
+  // lock prevents rmSync from cleaning up, and the orphaned worktree directory
+  // causes every subsequent `/gsd auto` to re-enter the stale worktree.
+  if (existsSync(resolvedWtPath)) {
+    try {
+      const wtInternalDir = join(basePath, ".git", "worktrees", name);
+      if (existsSync(wtInternalDir)) {
+        rmSync(wtInternalDir, { recursive: true, force: true });
+      }
+      rmSync(resolvedWtPath, { recursive: true, force: true });
+    } catch {
+      logWarning(
+        "reconcile",
+        `Worktree directory could not be removed after git internal cleanup: ${resolvedWtPath}. ` +
+          `Manual cleanup: rm -rf "${resolvedWtPath.replaceAll("\\", "/")}"`,
+        { worktree: name },
+      );
+    }
   }
 
   // Prune stale entries so git knows the worktree is gone

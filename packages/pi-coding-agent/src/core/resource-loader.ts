@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.js";
@@ -127,6 +127,14 @@ export interface DefaultResourceLoaderOptions {
 	noThemes?: boolean;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
+	/** Names of bundled extensions (used to identify built-in extensions in conflict detection). */
+	bundledExtensionNames?: Set<string>;
+	/**
+	 * Transform extension paths before loading. Receives the merged list of all
+	 * discovered extension paths and returns a (possibly reordered/filtered) list.
+	 * Use this to apply dependency sorting or registry-based filtering.
+	 */
+	extensionPathsTransform?: (paths: string[]) => { paths: string[]; diagnostics?: string[] };
 	extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
 	skillsOverride?: (base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }) => {
 		skills: Skill[];
@@ -164,6 +172,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private noThemes: boolean;
 	private systemPromptSource?: string;
 	private appendSystemPromptSource?: string;
+	private bundledExtensionNames: Set<string>;
+	private extensionPathsTransform?: (paths: string[]) => { paths: string[]; diagnostics?: string[] };
 	private extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
 	private skillsOverride?: (base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }) => {
 		skills: Skill[];
@@ -219,6 +229,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.noThemes = options.noThemes ?? false;
 		this.systemPromptSource = options.systemPrompt;
 		this.appendSystemPromptSource = options.appendSystemPrompt;
+		this.bundledExtensionNames = options.bundledExtensionNames ?? new Set();
+		this.extensionPathsTransform = options.extensionPathsTransform;
 		this.extensionsOverride = options.extensionsOverride;
 		this.skillsOverride = options.skillsOverride;
 		this.promptsOverride = options.promptsOverride;
@@ -374,9 +386,20 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledPrompts = getEnabledPaths(cliExtensionPaths.prompts);
 		const cliEnabledThemes = getEnabledPaths(cliExtensionPaths.themes);
 
-		const extensionPaths = this.noExtensions
+		let extensionPaths = this.noExtensions
 			? cliEnabledExtensions
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
+
+		// Apply path transform (dependency sorting, registry filtering) if provided
+		if (this.extensionPathsTransform) {
+			const transformed = this.extensionPathsTransform(extensionPaths);
+			extensionPaths = transformed.paths;
+			if (transformed.diagnostics?.length) {
+				for (const msg of transformed.diagnostics) {
+					process.stderr.write(`[extensions] ${msg}\n`);
+				}
+			}
+		}
 
 		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus);
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
@@ -790,6 +813,19 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return target.startsWith(prefix);
 	}
 
+	/**
+	 * Extract the extension name from its path.
+	 * For root-level files: basename without extension (e.g. "search-the-web.ts" → "search-the-web")
+	 * For subdirectory extensions: the directory name (e.g. "/path/to/gsd/index.ts" → "gsd")
+	 */
+	private getExtensionNameFromPath(extPath: string): string {
+		const base = basename(extPath);
+		if (base === "index.js" || base === "index.ts") {
+			return basename(dirname(extPath));
+		}
+		return base.replace(/\.(?:ts|js)$/, "");
+	}
+
 	private detectExtensionConflicts(extensions: Extension[]): Array<{ path: string; message: string }> {
 		const conflicts: Array<{ path: string; message: string }> = [];
 
@@ -803,9 +839,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 			for (const toolName of ext.tools.keys()) {
 				const existingOwner = toolOwners.get(toolName);
 				if (existingOwner && existingOwner !== ext.path) {
-					// Determine if the existing owner is a built-in (not a user extension)
-					const isBuiltIn = !existingOwner.includes("/.gsd/agent/extensions/") &&
-						!existingOwner.includes("/.gsd/extensions/");
+					// Determine if the existing owner is a bundled extension by checking
+					// its name against the canonical bundled extensions list
+					const ownerName = this.getExtensionNameFromPath(existingOwner);
+					const isBuiltIn = this.bundledExtensionNames.has(ownerName);
 					const hint = isBuiltIn
 						? ` (built-in tool supersedes — consider removing ${ext.path})`
 						: "";
@@ -822,8 +859,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 			for (const commandName of ext.commands.keys()) {
 				const existingOwner = commandOwners.get(commandName);
 				if (existingOwner && existingOwner !== ext.path) {
-					const isBuiltIn = !existingOwner.includes("/.gsd/agent/extensions/") &&
-						!existingOwner.includes("/.gsd/extensions/");
+					const ownerName = this.getExtensionNameFromPath(existingOwner);
+					const isBuiltIn = this.bundledExtensionNames.has(ownerName);
 					const hint = isBuiltIn
 						? ` (built-in command supersedes — consider removing ${ext.path})`
 						: "";

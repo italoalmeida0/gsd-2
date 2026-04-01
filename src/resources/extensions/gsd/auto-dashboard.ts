@@ -15,14 +15,34 @@ import {
   resolveMilestoneFile,
   resolveSliceFile,
 } from "./paths.js";
-import { parseRoadmap, parsePlan } from "./files.js";
+import { isDbAvailable, getMilestoneSlices, getSliceTasks } from "./gsd-db.js";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { truncateToWidth, visibleWidth } from "@gsd/pi-tui";
-import { makeUI, GLYPH, INDENT } from "../shared/mod.js";
+import { makeUI } from "../shared/tui.js";
+import { GLYPH, INDENT } from "../shared/mod.js";
 import { computeProgressScore } from "./progress-score.js";
 import { getActiveWorktreeName } from "./worktree-command.js";
 import { loadEffectiveGSDPreferences, getGlobalGSDPreferencesPath } from "./preferences.js";
+import { resolveServiceTierIcon, getEffectiveServiceTier } from "./service-tier.js";
+import { parseUnitId } from "./unit-id.js";
+import {
+  formatRtkSavingsLabel,
+  getRtkSessionSavings,
+  type RtkSessionSavings,
+} from "../shared/rtk-session-stats.js";
+
+// ─── UAT Slice Extraction ─────────────────────────────────────────────────────
+
+/**
+ * Extract the target slice ID from a run-uat unit ID (e.g. "M001/S01" → "S01").
+ * Returns null if the format doesn't match.
+ */
+export function extractUatSliceId(unitId: string): string | null {
+  const { slice } = parseUnitId(unitId);
+  if (slice?.startsWith("S")) return slice;
+  return null;
+}
 
 // ─── Dashboard Data ───────────────────────────────────────────────────────────
 
@@ -34,7 +54,6 @@ export interface AutoDashboardData {
   startTime: number;
   elapsed: number;
   currentUnit: { type: string; id: string; startedAt: number } | null;
-  completedUnits: { type: string; id: string; startedAt: number; finishedAt: number }[];
   basePath: string;
   /** Running cost and token totals from metrics ledger */
   totalCost: number;
@@ -45,6 +64,10 @@ export interface AutoDashboardData {
   profileDowngraded?: boolean;
   /** Number of pending captures awaiting triage (0 if none or file missing) */
   pendingCaptureCount: number;
+  /** RTK token savings for the current session, or null when unavailable. */
+  rtkSavings?: RtkSessionSavings | null;
+  /** Whether RTK is enabled via experimental.rtk preference. False when not opted in. */
+  rtkEnabled?: boolean;
   /** Cross-process: another auto-mode session detected via auto.lock (PID, startedAt) */
   remoteSession?: { pid: number; startedAt: string; unitType: string; unitId: string };
 }
@@ -54,6 +77,8 @@ export interface AutoDashboardData {
 export function unitVerb(unitType: string): string {
   if (unitType.startsWith("hook/")) return `hook: ${unitType.slice(5)}`;
   switch (unitType) {
+    case "discuss-milestone":
+    case "discuss-slice": return "discussing";
     case "research-milestone":
     case "research-slice": return "researching";
     case "plan-milestone":
@@ -64,6 +89,7 @@ export function unitVerb(unitType: string): string {
     case "rewrite-docs": return "rewriting";
     case "reassess-roadmap": return "reassessing";
     case "run-uat": return "running UAT";
+    case "custom-step": return "executing workflow step";
     default: return unitType;
   }
 }
@@ -71,6 +97,8 @@ export function unitVerb(unitType: string): string {
 export function unitPhaseLabel(unitType: string): string {
   if (unitType.startsWith("hook/")) return "HOOK";
   switch (unitType) {
+    case "discuss-milestone":
+    case "discuss-slice": return "DISCUSS";
     case "research-milestone": return "RESEARCH";
     case "research-slice": return "RESEARCH";
     case "plan-milestone": return "PLAN";
@@ -81,6 +109,7 @@ export function unitPhaseLabel(unitType: string): string {
     case "rewrite-docs": return "REWRITE";
     case "reassess-roadmap": return "REASSESS";
     case "run-uat": return "UAT";
+    case "custom-step": return "WORKFLOW";
     default: return unitType.toUpperCase();
   }
 }
@@ -95,6 +124,8 @@ function peekNext(unitType: string, state: GSDState): string {
   const sid = state.activeSlice?.id ?? "";
   if (unitType.startsWith("hook/")) return `continue ${sid}`;
   switch (unitType) {
+    case "discuss-milestone": return "research or plan milestone";
+    case "discuss-slice": return "plan slice";
     case "research-milestone": return "plan milestone roadmap";
     case "plan-milestone": return "plan or execute first slice";
     case "research-slice": return `plan ${sid}`;
@@ -133,6 +164,8 @@ export function describeNextUnit(state: GSDState): { label: string; description:
       return { label: `Replan ${sid}: ${sTitle}`, description: "Blocker found — replan the slice." };
     case "completing-milestone":
       return { label: "Complete milestone", description: "Write milestone summary." };
+    case "evaluating-gates":
+      return { label: `Evaluate gates for ${sid}: ${sTitle}`, description: "Parallel quality gate assessment before execution." };
     default:
       return { label: "Continue", description: "Execute the next step." };
   }
@@ -142,8 +175,9 @@ export function describeNextUnit(state: GSDState): { label: string; description:
 
 /** Format elapsed time since auto-mode started */
 export function formatAutoElapsed(autoStartTime: number): string {
-  if (!autoStartTime) return "";
+  if (!autoStartTime || autoStartTime <= 0 || !Number.isFinite(autoStartTime)) return "";
   const ms = Date.now() - autoStartTime;
+  if (ms < 0 || ms > 30 * 24 * 3600_000) return ""; // negative or >30 days = invalid
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
@@ -228,24 +262,28 @@ let cachedSliceProgress: {
 
 export function updateSliceProgressCache(base: string, mid: string, activeSid?: string): void {
   try {
-    const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-    if (!roadmapFile) return;
-    const content = readFileSync(roadmapFile, "utf-8");
-    const roadmap = parseRoadmap(content);
+    // Normalize slices: prefer DB, fall back to parser
+    type NormSlice = { id: string; done: boolean; title: string };
+    let normSlices: NormSlice[];
+    if (isDbAvailable()) {
+      normSlices = getMilestoneSlices(mid).map(s => ({ id: s.id, done: s.status === "complete", title: s.title }));
+    } else {
+      normSlices = [];
+    }
 
     let activeSliceTasks: { done: number; total: number } | null = null;
     let taskDetails: CachedTaskDetail[] | null = null;
     if (activeSid) {
       try {
-        const planFile = resolveSliceFile(base, mid, activeSid, "PLAN");
-        if (planFile && existsSync(planFile)) {
-          const planContent = readFileSync(planFile, "utf-8");
-          const plan = parsePlan(planContent);
-          activeSliceTasks = {
-            done: plan.tasks.filter(t => t.done).length,
-            total: plan.tasks.length,
-          };
-          taskDetails = plan.tasks.map(t => ({ id: t.id, title: t.title, done: t.done }));
+        if (isDbAvailable()) {
+          const dbTasks = getSliceTasks(mid, activeSid);
+          if (dbTasks.length > 0) {
+            activeSliceTasks = {
+              done: dbTasks.filter(t => t.status === "complete" || t.status === "done").length,
+              total: dbTasks.length,
+            };
+            taskDetails = dbTasks.map(t => ({ id: t.id, title: t.title, done: t.status === "complete" || t.status === "done" }));
+          }
         }
       } catch {
         // Non-fatal — just omit task count
@@ -253,8 +291,8 @@ export function updateSliceProgressCache(base: string, mid: string, activeSid?: 
     }
 
     cachedSliceProgress = {
-      done: roadmap.slices.filter(s => s.done).length,
-      total: roadmap.slices.length,
+      done: normSlices.filter(s => s.done).length,
+      total: normSlices.length,
       milestoneId: mid,
       activeSliceTasks,
       taskDetails,
@@ -289,7 +327,7 @@ function refreshLastCommit(basePath: string): void {
     const sep = raw.indexOf("|");
     if (sep > 0) {
       cachedLastCommit = {
-        timeAgo: raw.slice(0, sep).replace(/ ago$/, "").replace(/ /g, ""),
+        timeAgo: raw.slice(0, sep).replace(/ ago$/, ""),
         message: raw.slice(sep + 1),
       };
     }
@@ -407,9 +445,16 @@ export function updateProgressWidget(
   const verb = unitVerb(unitType);
   const phaseLabel = unitPhaseLabel(unitType);
   const mid = state.activeMilestone;
-  const slice = state.activeSlice;
-  const task = state.activeTask;
   const isHook = unitType.startsWith("hook/");
+
+  // When run-uat is executing for a just-completed slice (e.g. S01),
+  // deriveState() has already advanced activeSlice to the next one (S02).
+  // Override the displayed slice to match the UAT target from the unit ID.
+  const uatTargetSliceId = unitType === "run-uat" ? extractUatSliceId(unitId) : null;
+  const slice = uatTargetSliceId
+    ? { id: uatTargetSliceId, title: state.activeSlice?.title ?? "" }
+    : state.activeSlice;
+  const task = state.activeTask;
 
   // Cache git branch at widget creation time (not per render)
   let cachedBranch: string | null = null;
@@ -436,10 +481,26 @@ export function updateProgressWidget(
   // Pre-fetch last commit for display
   refreshLastCommit(accessors.getBasePath());
 
+  // Cache the effective service tier at widget creation time (reads preferences)
+  const effectiveServiceTier = getEffectiveServiceTier();
+
   ctx.ui.setWidget("gsd-progress", (tui, theme) => {
     let pulseBright = true;
     let cachedLines: string[] | undefined;
     let cachedWidth: number | undefined;
+    let cachedRtkLabel: string | null | undefined;
+
+    const refreshRtkLabel = (): void => {
+      try {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const savings = sessionId ? getRtkSessionSavings(accessors.getBasePath(), sessionId) : null;
+        cachedRtkLabel = formatRtkSavingsLabel(savings);
+      } catch {
+        cachedRtkLabel = null;
+      }
+    };
+
+    refreshRtkLabel();
 
     const pulseTimer = setInterval(() => {
       pulseBright = !pulseBright;
@@ -451,12 +512,15 @@ export function updateProgressWidget(
     // task/slice completion mid-unit. Without this, the progress bar only
     // updates at dispatch time, appearing frozen during long-running units.
     // 15s (vs 5s) reduces synchronous file I/O on the hot path.
-    const progressRefreshTimer = mid ? setInterval(() => {
+    const progressRefreshTimer = setInterval(() => {
       try {
-        updateSliceProgressCache(accessors.getBasePath(), mid.id, slice?.id);
+        if (mid) {
+          updateSliceProgressCache(accessors.getBasePath(), mid.id, slice?.id);
+        }
+        refreshRtkLabel();
         cachedLines = undefined;
       } catch { /* non-fatal */ }
-    }, 15_000) : null;
+    }, 15_000);
 
     return {
       render(width: number): string[] {
@@ -505,6 +569,27 @@ export function updateProgressWidget(
           : "";
         lines.push(rightAlign(headerLeft, headerRight, width));
 
+        // Worktree/branch right-aligned below header
+        if (worktreeName && cachedBranch) {
+          lines.push(rightAlign("", theme.fg("dim", `${worktreeName} (${cachedBranch})`), width));
+        } else if (cachedBranch) {
+          lines.push(rightAlign("", theme.fg("dim", cachedBranch), width));
+        }
+
+        // Show health signal details when degraded (yellow/red)
+        if (score.level !== "green" && score.signals.length > 0 && widgetMode !== "min") {
+          // Show up to 3 most relevant signals in compact form
+          const topSignals = score.signals
+            .filter(s => s.kind === "negative")
+            .slice(0, 3);
+          if (topSignals.length > 0) {
+            const signalStr = topSignals
+              .map(s => theme.fg("dim", s.label))
+              .join(theme.fg("dim", " · "));
+            lines.push(`${pad}  ${signalStr}`);
+          }
+        }
+
         // ── Gather stats (needed by multiple modes) ─────────────────────
         const cmdCtx = accessors.getCmdCtx();
         let totalInput = 0;
@@ -534,9 +619,10 @@ export function updateProgressWidget(
         // Model display — shown in context section, not stats
         const modelId = cmdCtx?.model?.id ?? "";
         const modelProvider = cmdCtx?.model?.provider ?? "";
-        const modelDisplay = modelProvider && modelId
+        const tierIcon = resolveServiceTierIcon(effectiveServiceTier, modelId);
+        const modelDisplay = (modelProvider && modelId
           ? `${modelProvider}/${modelId}`
-          : modelId;
+          : modelId) + (tierIcon ? ` ${tierIcon}` : "");
 
         // ── Mode: off — return empty ──────────────────────────────────
         if (widgetMode === "off") {
@@ -603,12 +689,12 @@ export function updateProgressWidget(
         const hasContext = !!(mid || (slice && unitType !== "research-milestone" && unitType !== "plan-milestone"));
         if (mid) {
           const modelTag = modelDisplay ? theme.fg("muted", `  ${modelDisplay}`) : "";
-          lines.push(truncateToWidth(`${pad}${theme.fg("dim", mid.title)}${modelTag}`, width));
+          lines.push(truncateToWidth(`${pad}${theme.fg("dim", mid.title)}${modelTag}`, width, "…"));
         }
         if (slice && unitType !== "research-milestone" && unitType !== "plan-milestone") {
           lines.push(truncateToWidth(
             `${pad}${theme.fg("text", theme.bold(`${slice.id}: ${slice.title}`))}`,
-            width,
+            width, "…",
           ));
         }
         if (hasContext) lines.push("");
@@ -654,6 +740,12 @@ export function updateProgressWidget(
         const rightLines: string[] = [];
         const maxVisibleTasks = 8;
 
+        // Max visible chars for task title text (before ANSI theming)
+        const maxTaskTitleLen = 45;
+        function truncTitle(s: string): string {
+          return s.length > maxTaskTitleLen ? s.slice(0, maxTaskTitleLen - 1) + "…" : s;
+        }
+
         function formatTaskLine(t: { id: string; title: string; done: boolean }, isCurrent: boolean): string {
           const glyph = t.done
             ? theme.fg("success", "*")
@@ -665,11 +757,12 @@ export function updateProgressWidget(
             : t.done
               ? theme.fg("muted", t.id)
               : theme.fg("dim", t.id);
+          const short = truncTitle(t.title);
           const title = isCurrent
-            ? theme.fg("text", t.title)
+            ? theme.fg("text", short)
             : t.done
-              ? theme.fg("muted", t.title)
-              : theme.fg("text", t.title);
+              ? theme.fg("muted", short)
+              : theme.fg("text", short);
           return `${glyph} ${id}: ${title}`;
         }
 
@@ -692,7 +785,7 @@ export function updateProgressWidget(
           if (maxRows > 0) {
             lines.push("");
             for (let i = 0; i < maxRows; i++) {
-              const left = padToWidth(truncateToWidth(leftLines[i] ?? "", leftColWidth), leftColWidth);
+              const left = padToWidth(truncateToWidth(leftLines[i] ?? "", leftColWidth, "…"), leftColWidth);
               const right = rightLines[i] ?? "";
               lines.push(`${left}${right}`);
             }
@@ -700,7 +793,7 @@ export function updateProgressWidget(
         } else {
           if (leftLines.length > 0) {
             lines.push("");
-            for (const l of leftLines) lines.push(truncateToWidth(l, width));
+            for (const l of leftLines) lines.push(truncateToWidth(l, width, "…"));
           }
         }
 
@@ -725,24 +818,31 @@ export function updateProgressWidget(
           if (statsLine) {
             lines.push(rightAlign("", statsLine, width));
           }
+          if (cachedRtkLabel) {
+            lines.push(rightAlign("", theme.fg("dim", cachedRtkLabel), width));
+          }
         }
-        // PWD line with last commit info right-aligned
+        // Last commit info
         const lastCommit = getLastCommit(accessors.getBasePath());
-        const commitStr = lastCommit
-          ? theme.fg("dim", `${lastCommit.timeAgo} ago: ${lastCommit.message}`)
+        const maxCommitLen = 65;
+        const commitMsg = lastCommit
+          ? lastCommit.message.length > maxCommitLen
+            ? lastCommit.message.slice(0, maxCommitLen - 1) + "…"
+            : lastCommit.message
           : "";
-        const pwdStr = theme.fg("dim", widgetPwd);
-        if (commitStr) {
-          lines.push(rightAlign(`${pad}${pwdStr}`, truncateToWidth(commitStr, Math.floor(width * 0.45)), width));
-        } else {
-          lines.push(`${pad}${pwdStr}`);
-        }
         // Hints line
         const hintParts: string[] = [];
         hintParts.push("esc pause");
         hintParts.push(process.platform === "darwin" ? "⌃⌥G dashboard" : "Ctrl+Alt+G dashboard");
         const hintStr = theme.fg("dim", hintParts.join(" | "));
-        lines.push(rightAlign("", hintStr, width));
+        const commitStr = lastCommit
+          ? theme.fg("dim", `${lastCommit.timeAgo} ago: ${commitMsg}`)
+          : "";
+        if (commitStr) {
+          lines.push(rightAlign(`${pad}${commitStr}`, hintStr, width));
+        } else {
+          lines.push(rightAlign("", hintStr, width));
+        }
 
         lines.push(...ui.bar());
 
@@ -769,12 +869,12 @@ function rightAlign(left: string, right: string, width: number): string {
   const leftVis = visibleWidth(left);
   const rightVis = visibleWidth(right);
   const gap = Math.max(1, width - leftVis - rightVis);
-  return truncateToWidth(left + " ".repeat(gap) + right, width);
+  return truncateToWidth(left + " ".repeat(gap) + right, width, "…");
 }
 
 /** Pad a string with trailing spaces to fill exactly `colWidth` (ANSI-aware). */
 function padToWidth(s: string, colWidth: number): string {
   const vis = visibleWidth(s);
-  if (vis >= colWidth) return truncateToWidth(s, colWidth);
+  if (vis >= colWidth) return truncateToWidth(s, colWidth, "…");
   return s + " ".repeat(colWidth - vis);
 }

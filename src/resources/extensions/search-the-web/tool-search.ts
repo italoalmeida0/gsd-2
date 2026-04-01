@@ -106,9 +106,21 @@ searchCache.startPurgeInterval(60_000);
 
 // Consecutive duplicate search guard (#949)
 // Tracks recent query keys to detect and break search loops.
-const MAX_CONSECUTIVE_DUPES = 3;
+const MAX_CONSECUTIVE_DUPES = 1;
 let lastSearchKey = "";
 let consecutiveDupeCount = 0;
+
+// Session-level total search budget (all queries, not just duplicates).
+// Prevents unbounded search accumulation across varied queries.
+const MAX_SEARCHES_PER_SESSION = 15;
+let sessionTotalSearches = 0;
+
+/** Reset session-scoped search guard state (both duplicate and budget). */
+export function resetSearchLoopGuardState(): void {
+  lastSearchKey = "";
+  consecutiveDupeCount = 0;
+  sessionTotalSearches = 0;
+}
 
 // Summarizer responses: max 50 entries, 15-minute TTL
 const summarizerCache = new LRUTTLCache<string>({ max: 50, ttlMs: 900_000 });
@@ -351,6 +363,17 @@ export function registerSearchTool(pi: ExtensionAPI) {
         };
       }
 
+      // ------------------------------------------------------------------
+      // Session-level search budget
+      // ------------------------------------------------------------------
+      if (sessionTotalSearches >= MAX_SEARCHES_PER_SESSION) {
+        return {
+          content: [{ type: "text" as const, text: `⚠️ Search budget exhausted: ${sessionTotalSearches}/${MAX_SEARCHES_PER_SESSION} searches used this session. The information you need should already be in previous search results. Stop searching and use those results to proceed with your task.` }],
+          isError: true,
+          details: { errorKind: "budget_exhausted", error: `Session search budget exhausted (${MAX_SEARCHES_PER_SESSION})` } satisfies Partial<SearchDetails>,
+        };
+      }
+
       const count = params.count ?? 5;
       const wantSummary = params.summary ?? false;
 
@@ -383,24 +406,29 @@ export function registerSearchTool(pi: ExtensionAPI) {
       // ------------------------------------------------------------------
       const cacheKey = normalizeQuery(effectiveQuery) + `|f:${freshness || ""}|s:${wantSummary}|p:${provider}`;
 
-      // ── Consecutive duplicate search guard (#949) ──────────────────────
+      // ── Consecutive duplicate search guard (#949, #1671) ─────────────────
       // If the LLM keeps calling the same search query, break the loop
       // with an explicit warning instead of returning the same results.
+      // After the threshold is hit, do NOT reset the state — this keeps the
+      // guard armed so every subsequent duplicate immediately re-triggers it,
+      // preventing the "sawtooth" pattern where resetting allowed infinite loops
+      // with brief interruptions every MAX_CONSECUTIVE_DUPES+1 calls.
       if (cacheKey === lastSearchKey) {
         consecutiveDupeCount++;
-        if (consecutiveDupeCount >= MAX_CONSECUTIVE_DUPES) {
-          consecutiveDupeCount = 0;
-          lastSearchKey = "";
+        if (consecutiveDupeCount > MAX_CONSECUTIVE_DUPES) {
           return {
-            content: [{ type: "text" as const, text: `⚠️ Search loop detected: the query "${params.query}" has been searched ${MAX_CONSECUTIVE_DUPES + 1} times consecutively with identical results. The information you need is already in the previous search results above. Stop searching and use those results to proceed with your task.` }],
+            content: [{ type: "text" as const, text: `⚠️ Search loop detected: the query "${params.query}" has been searched ${consecutiveDupeCount} times consecutively with identical results. The information you need is already in the previous search results above. Stop searching and use those results to proceed with your task.` }],
             isError: true,
             details: { errorKind: "search_loop", error: "Consecutive duplicate search detected" } satisfies Partial<SearchDetails>,
           };
         }
       } else {
         lastSearchKey = cacheKey;
-        consecutiveDupeCount = 0;
+        consecutiveDupeCount = 1;
       }
+
+      // Count every search that passes the guards toward the session budget.
+      sessionTotalSearches++;
 
       const cached = searchCache.get(cacheKey);
 

@@ -21,8 +21,10 @@ import { readCrashLock, isLockProcessAlive, clearLock } from "./crash-recovery.j
 import { abortAndReset } from "./git-self-heal.js";
 import { rebuildState } from "./doctor.js";
 import { deriveState } from "./state.js";
-import { readIntegrationBranch } from "./git-service.js";
-import { nativeBranchExists, nativeIsRepo } from "./native-git-bridge.js";
+import { resolveMilestoneIntegrationBranch } from "./git-service.js";
+import { nativeIsRepo, nativeHasChanges, nativeLastCommitEpoch, nativeGetCurrentBranch, nativeAddTracked, nativeCommit } from "./native-git-bridge.js";
+import { loadEffectiveGSDPreferences } from "./preferences.js";
+import { runEnvironmentChecks } from "./doctor-environment.js";
 
 // ── Health Score Tracking ──────────────────────────────────────────────────
 
@@ -276,17 +278,68 @@ export async function preDispatchHealthGate(basePath: string): Promise<PreDispat
     if (nativeIsRepo(basePath)) {
       const state = await deriveState(basePath);
       if (state.activeMilestone) {
-        const integrationBranch = readIntegrationBranch(basePath, state.activeMilestone.id);
-        if (integrationBranch && !nativeBranchExists(basePath, integrationBranch)) {
+        const gitPrefs = loadEffectiveGSDPreferences()?.preferences?.git ?? {};
+        const resolution = resolveMilestoneIntegrationBranch(basePath, state.activeMilestone.id, gitPrefs);
+        if (resolution.status === "fallback" && resolution.effectiveBranch) {
+          fixesApplied.push(
+            `using fallback integration branch "${resolution.effectiveBranch}" for milestone ${state.activeMilestone.id}; recorded "${resolution.recordedBranch}" no longer exists`,
+          );
+        } else if (resolution.recordedBranch && resolution.status === "missing") {
           issues.push(
-            `Integration branch "${integrationBranch}" for milestone ${state.activeMilestone.id} no longer exists in git. ` +
-            `Restore the branch or update the integration branch before dispatching. Run /gsd doctor for details.`,
+            `${resolution.reason} Restore the branch or update the integration branch before dispatching. Run /gsd doctor for details.`,
           );
         }
       }
     }
   } catch {
     // Non-fatal — dispatch continues if state/branch check fails
+  }
+
+  // ── Stale uncommitted changes — auto-snapshot before dispatch ──
+  // If the working tree is dirty and no commit has happened recently,
+  // create a safety snapshot so work isn't lost if the next unit crashes.
+  try {
+    if (nativeIsRepo(basePath)) {
+      const prefs = loadEffectiveGSDPreferences()?.preferences ?? {};
+      const thresholdMinutes = prefs.stale_commit_threshold_minutes ?? 30;
+
+      if (thresholdMinutes > 0 && nativeHasChanges(basePath)) {
+        const branch = nativeGetCurrentBranch(basePath);
+        const lastEpoch = nativeLastCommitEpoch(basePath, branch || "HEAD");
+        const nowEpoch = Math.floor(Date.now() / 1000);
+        const minutesSinceCommit = lastEpoch > 0 ? (nowEpoch - lastEpoch) / 60 : Infinity;
+
+        if (minutesSinceCommit >= thresholdMinutes) {
+          const mins = Math.floor(minutesSinceCommit);
+          try {
+            nativeAddTracked(basePath);
+            const commitMsg = `gsd snapshot: pre-dispatch, uncommitted changes after ${mins}m inactivity`;
+            const result = nativeCommit(basePath, commitMsg);
+            if (result) {
+              fixesApplied.push(`pre-dispatch: created gsd snapshot after ${mins}m of uncommitted changes`);
+            }
+          } catch {
+            // Non-blocking — snapshot failed but dispatch can continue
+            fixesApplied.push("pre-dispatch: gsd snapshot failed");
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  // ── Disk space check ──
+  // Catches low-disk conditions before dispatch rather than letting the unit
+  // fail mid-execution with ENOSPC (which wastes a full LLM turn).
+  try {
+    const envResults = runEnvironmentChecks(basePath);
+    const diskError = envResults.find(r => r.name === "disk_space" && r.status === "error");
+    if (diskError) {
+      issues.push(`${diskError.message}${diskError.detail ? ` — ${diskError.detail}` : ""}`);
+    }
+  } catch {
+    // Non-fatal — dispatch continues if env check fails
   }
 
   // If we had critical issues that couldn't be auto-healed, block dispatch

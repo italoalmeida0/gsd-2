@@ -52,7 +52,7 @@ function makeDeps(
         fn: "mergeMilestoneToMain",
         args: [basePath, milestoneId, roadmapContent],
       });
-      return { pushed: false };
+      return { pushed: false, codeFilesChanged: true };
     },
     syncWorktreeStateBack: (
       mainBasePath: string,
@@ -139,11 +139,10 @@ function makeDeps(
     captureIntegrationBranch: (
       basePath: string,
       mid: string | undefined,
-      opts?: { commitDocs?: boolean },
     ) => {
       calls.push({
         fn: "captureIntegrationBranch",
-        args: [basePath, mid, opts],
+        args: [basePath, mid],
       });
     },
     ...overrides,
@@ -424,7 +423,7 @@ test("mergeAndExit in worktree mode shows pushed status", () => {
   const deps = makeDeps({
     isInAutoWorktree: () => true,
     getIsolationMode: () => "worktree",
-    mergeMilestoneToMain: () => ({ pushed: true }),
+    mergeMilestoneToMain: () => ({ pushed: true, codeFilesChanged: true }),
   });
   const ctx = makeNotifyCtx();
   const resolver = new WorktreeResolver(s, deps);
@@ -434,7 +433,7 @@ test("mergeAndExit in worktree mode shows pushed status", () => {
   assert.ok(ctx.messages.some((m) => m.msg.includes("Pushed to remote")));
 });
 
-test("mergeAndExit falls back to teardown when roadmap is missing", () => {
+test("mergeAndExit falls back to teardown with preserveBranch when roadmap is missing (#1573)", () => {
   const s = makeSession({
     basePath: "/project/.gsd/worktrees/M001",
     originalBasePath: "/project",
@@ -449,10 +448,43 @@ test("mergeAndExit falls back to teardown when roadmap is missing", () => {
 
   resolver.mergeAndExit("M001", ctx);
 
-  assert.equal(findCalls(deps.calls, "teardownAutoWorktree").length, 1);
+  const teardownCalls = findCalls(deps.calls, "teardownAutoWorktree");
+  assert.equal(teardownCalls.length, 1);
+  // Branch must be preserved so commits are not orphaned (#1573)
+  assert.deepEqual(teardownCalls[0].args[2], { preserveBranch: true });
   assert.equal(findCalls(deps.calls, "mergeMilestoneToMain").length, 0);
   assert.equal(s.basePath, "/project"); // restored
-  assert.ok(ctx.messages.some((m) => m.msg.includes("no roadmap for merge")));
+  assert.ok(ctx.messages.some((m) => m.msg.includes("branch preserved")));
+});
+
+test("mergeAndExit resolves roadmap from worktree when missing at project root (#1573)", () => {
+  const s = makeSession({
+    basePath: "/project/.gsd/worktrees/M001",
+    originalBasePath: "/project",
+  });
+  // resolveMilestoneFile returns null for project root, returns path for worktree
+  const deps = makeDeps({
+    isInAutoWorktree: () => true,
+    getIsolationMode: () => "worktree",
+    resolveMilestoneFile: (basePath: string) => {
+      if (basePath === "/project") return null; // missing at project root
+      if (basePath === "/project/.gsd/worktrees/M001") {
+        return "/project/.gsd/worktrees/M001/.gsd/milestones/M001/M001-ROADMAP.md";
+      }
+      return null;
+    },
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  // Should have called mergeMilestoneToMain, not bare teardown
+  assert.equal(findCalls(deps.calls, "mergeMilestoneToMain").length, 1);
+  // #2945 Bug 3: secondary teardown is now called after merge for cleanup
+  assert.equal(findCalls(deps.calls, "teardownAutoWorktree").length, 1);
+  assert.equal(s.basePath, "/project"); // restored
+  assert.ok(ctx.messages.some((m) => m.msg.includes("merged to main")));
 });
 
 test("mergeAndExit in worktree mode restores to project root on merge failure", () => {
@@ -479,6 +511,43 @@ test("mergeAndExit in worktree mode restores to project root on merge failure", 
     ),
   );
   assert.equal(findCalls(deps.calls, "GitServiceImpl").length, 1); // rebuilt after recovery
+});
+
+test("mergeAndExit failure message tells user worktree and branch are preserved (#1668)", () => {
+  // Regression test: before the fix, the failure message was a bare
+  // "Milestone merge failed: <reason>" with no recovery guidance. Users were
+  // left confused about whether their code had been deleted. The new message
+  // explicitly states that the worktree and branch are preserved and what to do.
+  const s = makeSession({
+    basePath: "/project/.gsd/worktrees/M001",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => true,
+    getIsolationMode: () => "worktree",
+    mergeMilestoneToMain: () => {
+      throw new Error("pathspec 'main' did not match any file(s) known to git");
+    },
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  const warning = ctx.messages.find((m) => m.level === "warning");
+  assert.ok(warning, "a warning message is emitted");
+  // Must contain the original error
+  assert.ok(warning!.msg.includes("pathspec 'main' did not match"), "warning includes the original error");
+  // Must tell the user their work is safe
+  assert.ok(
+    warning!.msg.includes("preserved"),
+    "warning tells user the worktree and branch are preserved",
+  );
+  // Must suggest a recovery action
+  assert.ok(
+    warning!.msg.includes("retry") || warning!.msg.includes("manually"),
+    "warning suggests a recovery action",
+  );
 });
 
 // ─── mergeAndExit Tests (branch mode) ────────────────────────────────────────
@@ -590,6 +659,81 @@ test("mergeAndExit in none mode is a no-op", () => {
   assert.equal(ctx.messages.length, 0);
 });
 
+// ─── #1906 — metadata-only merge warning ────────────────────────────────────
+
+test("mergeAndExit warns when merge contains no code changes (#1906)", () => {
+  const s = makeSession({
+    basePath: "/project/.gsd/worktrees/M001",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => true,
+    getIsolationMode: () => "worktree",
+    mergeMilestoneToMain: () => ({ pushed: false, codeFilesChanged: false }),
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  assert.ok(
+    ctx.messages.some((m) => m.msg.includes("NO code changes") && m.level === "warning"),
+    "must emit warning when only .gsd/ metadata was merged",
+  );
+  assert.ok(
+    !ctx.messages.some((m) => m.msg.includes("merged to main") && m.level === "info"),
+    "must NOT emit success-style info notification for metadata-only merge",
+  );
+});
+
+test("mergeAndExit emits info when merge contains code changes (#1906)", () => {
+  const s = makeSession({
+    basePath: "/project/.gsd/worktrees/M001",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => true,
+    getIsolationMode: () => "worktree",
+    mergeMilestoneToMain: () => ({ pushed: false, codeFilesChanged: true }),
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  assert.ok(
+    ctx.messages.some((m) => m.msg.includes("merged to main") && m.level === "info"),
+    "must emit info notification when code files were merged",
+  );
+  assert.ok(
+    !ctx.messages.some((m) => m.msg.includes("NO code changes")),
+    "must NOT emit metadata-only warning when code files were merged",
+  );
+});
+
+test("mergeAndExit branch mode warns when merge contains no code changes (#1906)", () => {
+  const s = makeSession({
+    basePath: "/project",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => false,
+    getIsolationMode: () => "branch",
+    getCurrentBranch: () => "milestone/M001",
+    autoWorktreeBranch: () => "milestone/M001",
+    mergeMilestoneToMain: () => ({ pushed: false, codeFilesChanged: false }),
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  assert.ok(
+    ctx.messages.some((m) => m.msg.includes("NO code changes") && m.level === "warning"),
+    "branch mode must emit warning when only .gsd/ metadata was merged",
+  );
+});
+
 // ─── mergeAndEnterNext Tests ─────────────────────────────────────────────────
 
 test("mergeAndEnterNext calls mergeAndExit then enterMilestone", () => {
@@ -608,7 +752,7 @@ test("mergeAndEnterNext calls mergeAndExit then enterMilestone", () => {
       _roadmap: string,
     ) => {
       callOrder.push(`merge:${milestoneId}`);
-      return { pushed: false };
+      return { pushed: false, codeFilesChanged: true };
     },
     getAutoWorktreePath: () => null,
     createAutoWorktree: (basePath: string, milestoneId: string) => {
@@ -702,4 +846,117 @@ test("GitService is rebuilt with originalBasePath after exitMilestone", () => {
   resolver.exitMilestone("M001", ctx);
 
   assert.equal(gitServiceBasePath, "/project"); // project root, not worktree
+});
+
+// ─── Isolation Degradation Tests (#2483) ──────────────────────────────────
+
+test("enterMilestone sets isolationDegraded when worktree creation throws (#2483)", () => {
+  const s = makeSession();
+  const deps = makeDeps({
+    getAutoWorktreePath: () => null,
+    createAutoWorktree: () => {
+      throw new Error("empty repo");
+    },
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.enterMilestone("M001", ctx);
+
+  assert.equal(s.isolationDegraded, true);
+  assert.equal(s.basePath, "/project"); // unchanged — error recovery
+});
+
+test("enterMilestone is no-op when isolationDegraded is true (#2483)", () => {
+  const s = makeSession();
+  s.isolationDegraded = true;
+  const deps = makeDeps();
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.enterMilestone("M001", ctx);
+
+  assert.equal(s.basePath, "/project"); // unchanged
+  assert.equal(findCalls(deps.calls, "createAutoWorktree").length, 0);
+  assert.equal(findCalls(deps.calls, "enterAutoWorktree").length, 0);
+  assert.equal(findCalls(deps.calls, "shouldUseWorktreeIsolation").length, 0);
+});
+
+test("mergeAndExit is no-op when isolationDegraded is true (#2483)", () => {
+  const s = makeSession({
+    basePath: "/project",
+    originalBasePath: "/project",
+  });
+  s.isolationDegraded = true;
+  const deps = makeDeps({
+    getIsolationMode: () => "worktree",
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  assert.equal(findCalls(deps.calls, "mergeMilestoneToMain").length, 0);
+  assert.equal(findCalls(deps.calls, "teardownAutoWorktree").length, 0);
+  assert.equal(findCalls(deps.calls, "getIsolationMode").length, 0);
+  assert.ok(
+    ctx.messages.some(
+      (m) => m.level === "info" && m.msg.includes("isolation was degraded"),
+    ),
+  );
+});
+
+test("isolationDegraded is reset by session.reset() (#2483)", () => {
+  const s = new AutoSession();
+  s.isolationDegraded = true;
+
+  s.reset();
+
+  assert.equal(s.isolationDegraded, false);
+});
+
+// ─── #2625 — Default isolation mode change must not orphan worktree commits ──
+
+test("mergeAndExit still merges when mode is 'none' but session is in a worktree (#2625)", () => {
+  // Scenario: user upgraded from a version where default was "worktree" to one
+  // where default is "none". They have an active worktree with committed work.
+  // mergeAndExit must detect the active worktree and merge regardless of config.
+  const s = makeSession({
+    basePath: "/project/.gsd/worktrees/M001",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => true,
+    getIsolationMode: () => "none", // config says "none" — but we ARE in a worktree
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  // Must still merge — not skip silently
+  assert.equal(findCalls(deps.calls, "mergeMilestoneToMain").length, 1,
+    "must call mergeMilestoneToMain even when isolation mode is 'none' but we are in a worktree");
+  assert.equal(s.basePath, "/project", "basePath must be restored to project root");
+  assert.ok(ctx.messages.some((m) => m.msg.includes("merged to main")),
+    "must notify about the merge");
+});
+
+test("mergeAndExit in none mode remains a no-op when NOT in a worktree (#2625)", () => {
+  // When mode is "none" and we are genuinely not in a worktree, it should still be a no-op.
+  const s = makeSession({
+    basePath: "/project",
+    originalBasePath: "/project",
+  });
+  const deps = makeDeps({
+    isInAutoWorktree: () => false,
+    getIsolationMode: () => "none",
+  });
+  const ctx = makeNotifyCtx();
+  const resolver = new WorktreeResolver(s, deps);
+
+  resolver.mergeAndExit("M001", ctx);
+
+  assert.equal(findCalls(deps.calls, "mergeMilestoneToMain").length, 0,
+    "must NOT merge when not in a worktree and mode is none");
 });

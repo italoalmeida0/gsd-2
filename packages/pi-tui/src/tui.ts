@@ -191,7 +191,8 @@ export class Container implements Component {
 	render(width: number): string[] {
 		const lines: string[] = [];
 		for (const child of this.children) {
-			lines.push(...child.render(width));
+			const rendered = child.render(width);
+			for (let i = 0; i < rendered.length; i++) lines.push(rendered[i]);
 		}
 		return lines;
 	}
@@ -398,6 +399,12 @@ export class TUI extends Container {
 
 	start(): void {
 		this.stopped = false;
+		// Non-TTY stdout (pipe) — skip TUI entirely to avoid burning CPU.
+		// RPC bridge processes have piped stdio; rendering ANSI escape codes
+		// to a pipe is pure waste and causes a runaway render loop. (issue #3095)
+		if (!this.terminal.isTTY) {
+			return;
+		}
 		this.terminal.start(
 			(data) => this.handleInput(data),
 			() => this.requestRender(),
@@ -457,6 +464,8 @@ export class TUI extends Container {
 	}
 
 	requestRender(force = false): void {
+		// Skip rendering on non-TTY stdout to prevent CPU burn (issue #3095)
+		if (!this.terminal.isTTY) return;
 		if (force) {
 			this.previousLines = [];
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
@@ -811,7 +820,7 @@ export class TUI extends Container {
 		buffer += "\x1b[?2026l"; // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
-			const debugDir = "/tmp/tui";
+			const debugDir = path.join(os.tmpdir(), "tui");
 			fs.mkdirSync(debugDir, { recursive: true });
 			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
 			const debugData = [

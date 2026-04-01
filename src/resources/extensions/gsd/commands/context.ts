@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@gsd/pi-coding-agent
 import { checkRemoteAutoSession, isAutoActive, isAutoPaused, stopAutoRemote } from "../auto.js";
 import { assertSafeDirectory } from "../validate-directory.js";
 import { resolveProjectRoot } from "../worktree.js";
-import { showNextAction } from "../../shared/mod.js";
+import { showNextAction } from "../../shared/tui.js";
 import { handleStatus } from "./handlers/core.js";
 
 export interface GsdDispatchContext {
@@ -35,15 +35,22 @@ export async function guardRemoteSession(
   const unitLabel = remote.unitType && remote.unitId
     ? `${remote.unitType} (${remote.unitId})`
     : "unknown unit";
-  const unitsMsg = remote.completedUnits != null
-    ? `${remote.completedUnits} units completed`
-    : "";
+
+  // In RPC/web bridge mode, interactive TUI prompts (showNextAction) block
+  // forever because there is no terminal to answer them. Notify and bail.
+  if (process.env.GSD_WEB_BRIDGE_TUI === "1") {
+    ctx.ui.notify(
+      `Another auto-mode session (PID ${remote.pid}) is running on this project (${unitLabel}). ` +
+      `Stop it first with /gsd stop, or use /gsd steer to redirect it.`,
+      "warning",
+    );
+    return false;
+  }
 
   const choice = await showNextAction(ctx, {
     title: `Auto-mode is running in another terminal (PID ${remote.pid})`,
     summary: [
       `Currently executing: ${unitLabel}`,
-      ...(unitsMsg ? [unitsMsg] : []),
       ...(remote.startedAt ? [`Started: ${remote.startedAt}`] : []),
     ],
     actions: [

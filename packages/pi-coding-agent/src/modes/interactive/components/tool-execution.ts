@@ -32,7 +32,7 @@ const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
  * Replace tabs with spaces for consistent rendering
  */
 function replaceTabs(text: string): string {
-	return text.replace(/\t/g, "   ");
+	return text.replace(/\t/g, "    ");
 }
 
 /**
@@ -895,7 +895,9 @@ export class ToolExecutionComponent extends Container {
 			// Server-side Anthropic web search
 			text = theme.fg("toolTitle", theme.bold("web search"));
 
-			if (this.result) {
+			if (process.env.PI_OFFLINE === "1") {
+				text += "\n\n" + theme.fg("muted", "\u{1F50C} Offline \u{2014} web search unavailable");
+			} else if (this.result) {
 				const output = this.getTextOutput().trim();
 				if (output) {
 					const lines = output.split("\n");
@@ -913,8 +915,13 @@ export class ToolExecutionComponent extends Container {
 			// Generic tool (shouldn't reach here for custom tools)
 			text = theme.fg("toolTitle", theme.bold(this.toolName));
 
-			const content = JSON.stringify(this.args, null, 2);
-			text += `\n\n${content}`;
+			const contentLines = JSON.stringify(this.args, null, 2).split("\n");
+			const maxContentLines = 20;
+			const truncatedContent = contentLines.slice(0, maxContentLines);
+			if (contentLines.length > maxContentLines) {
+				truncatedContent.push("...");
+			}
+			text += `\n\n${truncatedContent.join("\n")}`;
 			const output = this.getTextOutput();
 			if (output) {
 				text += `\n${output}`;

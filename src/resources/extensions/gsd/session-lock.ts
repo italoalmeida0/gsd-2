@@ -32,7 +32,6 @@ export interface SessionLockData {
   unitType: string;
   unitId: string;
   unitStartedAt: string;
-  completedUnits: number;
   sessionFile?: string;
 }
 
@@ -70,6 +69,10 @@ let _lockCompromised: boolean = false;
 /** Whether we've already registered a process.on('exit') handler. */
 let _exitHandlerRegistered: boolean = false;
 
+/** Registry of all gsdDir paths where locks were created during this session.
+ *  The exit handler cleans ALL of these, not just the current gsdRoot(). (#1578) */
+const _lockDirRegistry: Set<string> = new Set();
+
 /** Snapshotted lock file path — captured at acquireSessionLock time to avoid
  *  gsdRoot() resolving differently in worktree vs project root contexts (#1363). */
 let _snapshotLockPath: string | null = null;
@@ -80,10 +83,31 @@ let _lockAcquiredAt: number = 0;
 
 const LOCK_FILE = "auto.lock";
 
+/**
+ * Derive the effective lock file name for the current process.
+ * In parallel worker mode (GSD_PARALLEL_WORKER + GSD_MILESTONE_LOCK),
+ * each worker uses a per-milestone lock file (`auto-<milestoneId>.lock`)
+ * to avoid contending on the shared `.gsd/auto.lock` (#2184).
+ */
+export function effectiveLockFile(): string {
+  const mid = process.env.GSD_PARALLEL_WORKER ? process.env.GSD_MILESTONE_LOCK : null;
+  return mid ? `auto-${mid}.lock` : LOCK_FILE;
+}
+
+/**
+ * Derive the OS-level lock target directory for the current process.
+ * In parallel worker mode, uses `.gsd/parallel/<milestoneId>/` instead of
+ * `.gsd/` so workers don't contend on the same proper-lockfile directory (#2184).
+ */
+export function effectiveLockTarget(gsdDir: string): string {
+  const mid = process.env.GSD_PARALLEL_WORKER ? process.env.GSD_MILESTONE_LOCK : null;
+  return mid ? join(gsdDir, "parallel", mid) : gsdDir;
+}
+
 function lockPath(basePath: string): string {
   // If we have a snapshotted path from acquisition, use it for consistency
   if (_snapshotLockPath) return _snapshotLockPath;
-  return join(gsdRoot(basePath), LOCK_FILE);
+  return join(gsdRoot(basePath), effectiveLockFile());
 }
 
 // ─── Stray Lock Cleanup ─────────────────────────────────────────────────────
@@ -137,7 +161,10 @@ export function cleanupStrayLockFiles(basePath: string): void {
  * Uses module-level references so it always operates on current state.
  * Only registers once — subsequent calls are no-ops.
  */
-function ensureExitHandler(gsdDir: string): void {
+function ensureExitHandler(_gsdDir: string): void {
+  // Register the gsdDir so exit cleanup covers it
+  _lockDirRegistry.add(_gsdDir);
+
   if (_exitHandlerRegistered) return;
   _exitHandlerRegistered = true;
 
@@ -145,17 +172,70 @@ function ensureExitHandler(gsdDir: string): void {
     try {
       if (_releaseFunction) { _releaseFunction(); _releaseFunction = null; }
     } catch { /* best-effort */ }
-    // Remove the auto.lock metadata file so crash-recovery doesn't
-    // falsely detect an interrupted session on the next startup.
-    try {
-      const lockFile = join(gsdDir, LOCK_FILE);
-      if (existsSync(lockFile)) unlinkSync(lockFile);
-    } catch { /* best-effort */ }
-    try {
-      const lockDir = join(gsdDir + ".lock");
-      if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
-    } catch { /* best-effort */ }
+    // Clean ALL registered lock paths, not just the current one (#1578).
+    // Lock files accumulate across main project .gsd/, worktree .gsd/,
+    // and projects registry paths — cleanup must cover all of them.
+    for (const dir of _lockDirRegistry) {
+      try {
+        const lockFile = join(dir, LOCK_FILE);
+        if (existsSync(lockFile)) unlinkSync(lockFile);
+      } catch { /* best-effort */ }
+      try {
+        const lockDir = join(dir + ".lock");
+        if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
+      } catch { /* best-effort */ }
+    }
   });
+}
+
+// ─── Lock Acquisition Helpers ───────────────────────────────────────────────
+
+/**
+ * Create the onCompromised callback for proper-lockfile.
+ *
+ * proper-lockfile fires onCompromised when it detects mtime drift (system sleep,
+ * event loop stall, etc.). The default handler throws inside setTimeout — an
+ * uncaught exception that crashes or corrupts process state.
+ *
+ * False-positive suppression (#1362): If we're still within the stale window
+ * (30 min since acquisition), the mtime mismatch is from an event loop stall
+ * during a long LLM call — not a real takeover. Log and continue.
+ *
+ * PID ownership check (#1578): Past the stale window, check if the lock file
+ * still contains our PID before declaring compromise. Retry reads tolerate
+ * transient filesystem hiccups (NFS/CIFS latency, APFS snapshots, etc.) (#2324).
+ */
+function createLockCompromisedHandler(lockFilePath: string): () => void {
+  return () => {
+    const elapsed = Date.now() - _lockAcquiredAt;
+    if (elapsed < 1_800_000) {
+      process.stderr.write(
+        `[gsd] Lock heartbeat caught up after ${Math.round(elapsed / 1000)}s — long LLM call, no action needed.\n`,
+      );
+      return;
+    }
+    const existing = readExistingLockDataWithRetry(lockFilePath);
+    if (existing && existing.pid === process.pid) {
+      process.stderr.write(
+        `[gsd] Lock heartbeat mismatch after ${Math.round(elapsed / 1000)}s — lock file still owned by PID ${process.pid}, treating as false positive.\n`,
+      );
+      return;
+    }
+    _lockCompromised = true;
+    _releaseFunction = null;
+  };
+}
+
+/**
+ * Assign module-level lock state after a successful lock acquisition.
+ */
+function assignLockState(basePath: string, release: () => void, lockFilePath: string): void {
+  _releaseFunction = release;
+  _lockedPath = basePath;
+  _lockPid = process.pid;
+  _lockCompromised = false;
+  _lockAcquiredAt = Date.now();
+  _snapshotLockPath = lockFilePath;
 }
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -195,7 +275,6 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
     unitType: "starting",
     unitId: "bootstrap",
     unitStartedAt: new Date().toISOString(),
-    completedUnits: 0,
   };
 
   let lockfile: typeof import("proper-lockfile");
@@ -207,48 +286,27 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
   }
 
   const gsdDir = gsdRoot(basePath);
+  const lockTarget = effectiveLockTarget(gsdDir);
 
   try {
-    // Try to acquire an exclusive OS-level lock on the lock file.
-    // We lock the directory (gsdRoot) since proper-lockfile works best
-    // on directories, and the lock file itself may not exist yet.
-    mkdirSync(gsdDir, { recursive: true });
+    // Try to acquire an exclusive OS-level lock on the lock target.
+    // We lock a directory since proper-lockfile works best on directories,
+    // and the lock file itself may not exist yet.
+    // In parallel worker mode, lockTarget is .gsd/parallel/<MID>/ (#2184).
+    mkdirSync(lockTarget, { recursive: true });
 
-    const release = lockfile.lockSync(gsdDir, {
+    const release = lockfile.lockSync(lockTarget, {
       realpath: false,
       stale: 1_800_000, // 30 minutes — safe for laptop sleep / long event loop stalls
       update: 10_000, // Update lock mtime every 10s to prove liveness
-      onCompromised: () => {
-        // proper-lockfile detected mtime drift (system sleep, event loop stall, etc.).
-        // Default handler throws inside setTimeout — an uncaught exception that crashes
-        // or corrupts process state.
-        //
-        // False-positive suppression (#1362): If we're still within the stale window
-        // (30 min since acquisition), the mtime mismatch is from an event loop stall
-        // during a long LLM call — not a real takeover. Log and continue.
-        const elapsed = Date.now() - _lockAcquiredAt;
-        if (elapsed < 1_800_000) {
-          process.stderr.write(
-            `[gsd] Lock heartbeat mismatch after ${Math.round(elapsed / 1000)}s — event loop stall, continuing.\n`,
-          );
-          return; // Suppress false positive
-        }
-        // Past the stale window — this is a real compromise
-        _lockCompromised = true;
-        _releaseFunction = null;
-      },
+      onCompromised: createLockCompromisedHandler(lp),
     });
 
-    _releaseFunction = release;
-    _lockedPath = basePath;
-    _lockPid = process.pid;
-    _lockCompromised = false;
-    _lockAcquiredAt = Date.now();
-    _snapshotLockPath = lp; // Snapshot the resolved path for consistent access (#1363)
+    assignLockState(basePath, release, lp);
 
     // Safety net: clean up lock dir on process exit if _releaseFunction
     // wasn't called (e.g., normal exit after clean completion) (#1245).
-    ensureExitHandler(gsdDir);
+    ensureExitHandler(lockTarget);
 
     // Write the informational lock data
     atomicWriteSync(lp, JSON.stringify(lockData, null, 2));
@@ -263,39 +321,21 @@ export function acquireSessionLock(basePath: string): SessionLockResult {
     // If no lock file or no alive process, try to clean up and re-acquire (#1245)
     if (!existingData || (existingPid && !isPidAlive(existingPid))) {
       try {
-        const lockDir = join(gsdDir + ".lock");
+        const lockDir = join(lockTarget + ".lock");
         if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
         if (existsSync(lp)) unlinkSync(lp);
 
         // Retry acquisition after cleanup
-        const release = lockfile.lockSync(gsdDir, {
+        const release = lockfile.lockSync(lockTarget, {
           realpath: false,
           stale: 1_800_000, // 30 minutes — match primary lock settings
           update: 10_000,
-          onCompromised: () => {
-            // Same false-positive suppression as the primary lock (#1512).
-            // Without this, the retry path fires _lockCompromised unconditionally
-            // on benign mtime drift (laptop sleep, heavy LLM event loop stalls).
-            const elapsed = Date.now() - _lockAcquiredAt;
-            if (elapsed < 1_800_000) {
-              process.stderr.write(
-                `[gsd] Lock heartbeat mismatch after ${Math.round(elapsed / 1000)}s — event loop stall, continuing.\n`,
-              );
-              return;
-            }
-            _lockCompromised = true;
-            _releaseFunction = null;
-          },
+          onCompromised: createLockCompromisedHandler(lp),
         });
-        _releaseFunction = release;
-        _lockedPath = basePath;
-        _lockPid = process.pid;
-        _lockCompromised = false;
-        _lockAcquiredAt = Date.now();
-        _snapshotLockPath = lp; // Snapshot for retry path too (#1363)
+        assignLockState(basePath, release, lp);
 
         // Safety net — uses centralized handler to avoid double-registration
-        ensureExitHandler(gsdDir);
+        ensureExitHandler(lockTarget);
 
         atomicWriteSync(lp, JSON.stringify(lockData, null, 2));
         return { acquired: true };
@@ -351,7 +391,6 @@ export function updateSessionLock(
   basePath: string,
   unitType: string,
   unitId: string,
-  completedUnits: number,
   sessionFile?: string,
 ): void {
   if (_lockedPath !== basePath && _lockedPath !== null) return;
@@ -364,7 +403,6 @@ export function updateSessionLock(
       unitType,
       unitId,
       unitStartedAt: new Date().toISOString(),
-      completedUnits,
       sessionFile,
     };
     atomicWriteSync(lp, JSON.stringify(data, null, 2));
@@ -389,7 +427,8 @@ export function getSessionLockStatus(basePath: string): SessionLockStatus {
     // onCompromised fired from benign mtime drift (laptop sleep, event loop stall
     // beyond the stale window). Attempt re-acquisition instead of giving up.
     const lp = lockPath(basePath);
-    const existing = readExistingLockData(lp);
+    // Retry reads to tolerate transient filesystem hiccups (#2324).
+    const existing = readExistingLockDataWithRetry(lp);
     if (existing && existing.pid === process.pid) {
       // Lock file still ours — try to re-acquire the OS lock
       try {
@@ -459,7 +498,7 @@ export function releaseSessionLock(basePath: string): void {
     _releaseFunction = null;
   }
 
-  // Remove the lock file
+  // Remove the lock file at the current path
   const lp = lockPath(basePath);
   try {
     if (existsSync(lp)) unlinkSync(lp);
@@ -467,16 +506,38 @@ export function releaseSessionLock(basePath: string): void {
     // Non-fatal
   }
 
-  // Remove the proper-lockfile directory (.gsd.lock/) if it exists.
-  // proper-lockfile creates this directory as the OS-level lock mechanism.
-  // If the process exits without calling _releaseFunction (SIGKILL, crash),
-  // this directory is stranded and blocks the next session (#1245).
+  // Remove the proper-lockfile directory for the current lock target.
+  // In parallel worker mode, this is .gsd/parallel/<MID>.lock/ (#2184).
+  const gsdDir = gsdRoot(basePath);
+  const lockTarget = effectiveLockTarget(gsdDir);
   try {
-    const lockDir = join(gsdRoot(basePath) + ".lock");
+    const lockDir = join(lockTarget + ".lock");
     if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
   } catch {
     // Non-fatal
   }
+  // Also clean the per-milestone parallel directory itself if it exists
+  if (lockTarget !== gsdDir) {
+    try {
+      if (existsSync(lockTarget)) rmSync(lockTarget, { recursive: true, force: true });
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // Clean ALL registered lock paths (#1578) — lock files accumulate across
+  // main project .gsd/, worktree .gsd/, and projects registry paths.
+  for (const dir of _lockDirRegistry) {
+    try {
+      const lockFile = join(dir, LOCK_FILE);
+      if (existsSync(lockFile)) unlinkSync(lockFile);
+    } catch { /* best-effort */ }
+    try {
+      const lockDir = join(dir + ".lock");
+      if (existsSync(lockDir)) rmSync(lockDir, { recursive: true, force: true });
+    } catch { /* best-effort */ }
+  }
+  _lockDirRegistry.clear();
 
   // Clean up numbered lock file variants from cloud sync conflicts (#1315)
   cleanupStrayLockFiles(basePath);
@@ -510,6 +571,14 @@ export function isSessionLockHeld(basePath: string): boolean {
   return _lockedPath === basePath && _lockPid === process.pid;
 }
 
+/**
+ * Returns a snapshot of the registered lock directory paths for diagnostics.
+ * Exported for tests only.
+ */
+export function _getRegisteredLockDirs(): string[] {
+  return [..._lockDirRegistry];
+}
+
 // ─── Internal Helpers ───────────────────────────────────────────────────────
 
 function readExistingLockData(lp: string): SessionLockData | null {
@@ -520,6 +589,42 @@ function readExistingLockData(lp: string): SessionLockData | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Retry-tolerant variant of readExistingLockData for use in onCompromised and
+ * other paths where a transient filesystem hiccup (NFS/CIFS latency, macOS APFS
+ * snapshot, concurrent process briefly holding the file) should NOT be treated
+ * as "lock file gone" (#2324).
+ *
+ * Retries up to `maxAttempts` times with `delayMs` between each attempt.
+ * Only returns null when ALL retries fail to read valid data.
+ */
+export interface RetryOptions {
+  maxAttempts?: number;
+  delayMs?: number;
+}
+
+export function readExistingLockDataWithRetry(
+  lp: string,
+  options?: RetryOptions,
+): SessionLockData | null {
+  const maxAttempts = options?.maxAttempts ?? 3;
+  const delayMs = options?.delayMs ?? 200;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const data = readExistingLockData(lp);
+    if (data !== null) return data;
+    if (attempt < maxAttempts) {
+      // Synchronous busy-wait — onCompromised runs in a sync callback context
+      // and the delays are short (200ms default).
+      const start = Date.now();
+      while (Date.now() - start < delayMs) {
+        // busy-wait
+      }
+    }
+  }
+  return null;
 }
 
 function isPidAlive(pid: number): boolean {

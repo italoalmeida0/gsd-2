@@ -10,9 +10,11 @@
 import type { ExtensionContext } from "@gsd/pi-coding-agent";
 import { parseUnitId } from "./unit-id.js";
 import { atomicWriteSync } from "./atomic-write.js";
-import { clearUnitRuntimeRecord } from "./unit-runtime.js";
-import { clearParseCache, parseRoadmap, parsePlan } from "./files.js";
+import { clearParseCache } from "./files.js";
+import { parseRoadmap as parseLegacyRoadmap, parsePlan as parseLegacyPlan } from "./parsers-legacy.js";
+import { isDbAvailable, getTask, getSlice, getSliceTasks, updateTaskStatus } from "./gsd-db.js";
 import { isValidationTerminal } from "./state.js";
+import { getErrorMessage } from "./error-utils.js";
 import {
   nativeConflictFiles,
   nativeCommit,
@@ -22,23 +24,17 @@ import {
   nativeResetHard,
 } from "./native-git-bridge.js";
 import {
-  resolveMilestonePath,
   resolveSlicePath,
   resolveSliceFile,
   resolveTasksDir,
   resolveTaskFiles,
   relMilestoneFile,
   relSliceFile,
-  relSlicePath,
-  relTaskFile,
-  buildMilestoneFileName,
   buildSliceFileName,
-  buildTaskFileName,
   resolveMilestoneFile,
   clearPathCache,
   resolveGsdRootFile,
 } from "./paths.js";
-import { markSliceDoneInRoadmap } from "./roadmap-mutations.js";
 import {
   existsSync,
   mkdirSync,
@@ -46,76 +42,121 @@ import {
   writeFileSync,
   unlinkSync,
 } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
+import {
+  resolveExpectedArtifactPath,
+  diagnoseExpectedArtifact,
+} from "./auto-artifact-paths.js";
+
+// Re-export so existing consumers of auto-recovery.ts keep working.
+export { resolveExpectedArtifactPath, diagnoseExpectedArtifact };
 
 // ─── Artifact Resolution & Verification ───────────────────────────────────────
 
 /**
- * Resolve the expected artifact for a unit to an absolute path.
+ * Check whether a milestone produced implementation artifacts (non-`.gsd/` files)
+ * in the git history. Uses `git log --name-only` to inspect all commits on the
+ * current branch that touch files outside `.gsd/`.
+ *
+ * Returns true if at least one non-`.gsd/` file was committed, false otherwise.
+ * Non-fatal: returns true on git errors to avoid blocking the pipeline when
+ * running outside a git repo (e.g., tests).
  */
-export function resolveExpectedArtifactPath(
-  unitType: string,
-  unitId: string,
-  base: string,
-): string | null {
-  const parts = unitId.split("/");
-  const mid = parts[0]!;
-  const sid = parts[1];
-  switch (unitType) {
-    case "research-milestone": {
-      const dir = resolveMilestonePath(base, mid);
-      return dir ? join(dir, buildMilestoneFileName(mid, "RESEARCH")) : null;
+export function hasImplementationArtifacts(basePath: string): boolean {
+  try {
+    // Verify we're in a git repo — fail open if not
+    try {
+      execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+        cwd: basePath,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+      });
+    } catch {
+      return true;
     }
-    case "plan-milestone": {
-      const dir = resolveMilestonePath(base, mid);
-      return dir ? join(dir, buildMilestoneFileName(mid, "ROADMAP")) : null;
+
+    // Strategy: check `git diff --name-only` against the merge-base with the
+    // main branch. This captures ALL files changed during the milestone's
+    // lifetime. If no merge-base exists (e.g., single-branch workflow), fall
+    // back to checking the last N commits.
+    const mainBranch = detectMainBranch(basePath);
+    const changedFiles = getChangedFilesSinceBranch(basePath, mainBranch);
+
+    // No files changed at all — fail open (could be detached HEAD, single-
+    // commit repo, or other edge case where git diff returns nothing).
+    if (changedFiles.length === 0) return true;
+
+    // Filter out .gsd/ files — only implementation files count.
+    // If every changed file is under .gsd/, the milestone produced no
+    // implementation code (#1703).
+    const implFiles = changedFiles.filter(f => !f.startsWith(".gsd/") && !f.startsWith(".gsd\\"));
+    return implFiles.length > 0;
+  } catch {
+    // Non-fatal — if git operations fail, don't block the pipeline
+    return true;
+  }
+}
+
+/**
+ * Detect the main/master branch name.
+ */
+function detectMainBranch(basePath: string): string {
+  try {
+    const result = execFileSync("git", ["rev-parse", "--verify", "main"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+    if (result.trim()) return "main";
+  } catch {
+    // main doesn't exist
+  }
+  try {
+    const result = execFileSync("git", ["rev-parse", "--verify", "master"], {
+      cwd: basePath,
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+    });
+    if (result.trim()) return "master";
+  } catch {
+    // master doesn't exist either
+  }
+  return "main"; // default fallback
+}
+
+/**
+ * Get files changed since the branch diverged from the target branch.
+ * Falls back to checking HEAD~20 if merge-base detection fails.
+ */
+function getChangedFilesSinceBranch(basePath: string, targetBranch: string): string[] {
+  try {
+    // Try merge-base approach first
+    const mergeBase = execFileSync(
+      "git", ["merge-base", targetBranch, "HEAD"],
+      { cwd: basePath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+    ).trim();
+
+    if (mergeBase) {
+      const result = execFileSync(
+        "git", ["diff", "--name-only", mergeBase, "HEAD"],
+        { cwd: basePath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+      ).trim();
+      return result ? result.split("\n").filter(Boolean) : [];
     }
-    case "research-slice": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "RESEARCH")) : null;
-    }
-    case "plan-slice": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "PLAN")) : null;
-    }
-    case "reassess-roadmap": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "ASSESSMENT")) : null;
-    }
-    case "run-uat": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "UAT-RESULT")) : null;
-    }
-    case "execute-task": {
-      const tid = parts[2];
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir && tid
-        ? join(dir, "tasks", buildTaskFileName(tid, "SUMMARY"))
-        : null;
-    }
-    case "complete-slice": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "SUMMARY")) : null;
-    }
-    case "validate-milestone": {
-      const dir = resolveMilestonePath(base, mid);
-      return dir ? join(dir, buildMilestoneFileName(mid, "VALIDATION")) : null;
-    }
-    case "complete-milestone": {
-      const dir = resolveMilestonePath(base, mid);
-      return dir ? join(dir, buildMilestoneFileName(mid, "SUMMARY")) : null;
-    }
-    case "replan-slice": {
-      const dir = resolveSlicePath(base, mid, sid!);
-      return dir ? join(dir, buildSliceFileName(sid!, "REPLAN")) : null;
-    }
-    case "rewrite-docs":
-      return null;
-    case "reactive-execute":
-      // Reactive execute produces multiple task summaries — verified separately
-      return null;
-    default:
-      return null;
+  } catch {
+    // merge-base failed — fall back
+  }
+
+  // Fallback: check last 20 commits
+  try {
+    const result = execFileSync(
+      "git", ["log", "--name-only", "--pretty=format:", "-20", "HEAD"],
+      { cwd: basePath, stdio: ["ignore", "pipe", "pipe"], encoding: "utf-8" },
+    ).trim();
+    return result ? [...new Set(result.split("\n").filter(Boolean))] : [];
+  } catch {
+    return [];
   }
 }
 
@@ -155,13 +196,8 @@ export function verifyExpectedArtifact(
   // Reactive-execute: verify that each dispatched task's summary exists.
   // The unitId encodes the batch: "{mid}/{sid}/reactive+T02,T03"
   if (unitType === "reactive-execute") {
-    const parts = unitId.split("/");
-    const mid = parts[0];
-    const sidAndBatch = parts[1];
-    const batchPart = parts[2]; // "reactive+T02,T03"
-    if (!mid || !sidAndBatch || !batchPart) return false;
-
-    const sid = sidAndBatch;
+    const { milestone: mid, slice: sid, task: batchPart } = parseUnitId(unitId);
+    if (!mid || !sid || !batchPart) return false;
     const plusIdx = batchPart.indexOf("+");
     if (plusIdx === -1) {
       // Legacy format "reactive" without batch IDs — fall back to "any summary"
@@ -190,6 +226,32 @@ export function verifyExpectedArtifact(
     return true;
   }
 
+  // Gate-evaluate: verify that each dispatched gate has been resolved in the DB.
+  // The unitId encodes the batch: "{mid}/{sid}/gates+Q3,Q4"
+  if (unitType === "gate-evaluate") {
+    const { milestone: mid, slice: sid, task: batchPart } = parseUnitId(unitId);
+    if (!mid || !sid || !batchPart) return false;
+
+    const plusIdx = batchPart.indexOf("+");
+    if (plusIdx === -1) return true; // no specific gates encoded — pass
+
+    const gateIds = batchPart.slice(plusIdx + 1).split(",").filter(Boolean);
+    if (gateIds.length === 0) return true;
+
+    try {
+      const { getPendingGates: getPending } = require("./gsd-db.js");
+      const pending = getPending(mid, sid, "slice");
+      const pendingIds = new Set(pending.map((g: any) => g.gate_id));
+      // All dispatched gates must no longer be pending
+      for (const gid of gateIds) {
+        if (pendingIds.has(gid)) return false;
+      }
+    } catch {
+      // DB unavailable — treat as verified to avoid blocking
+    }
+    return true;
+  }
+
   const absPath = resolveExpectedArtifactPath(unitType, unitId, base);
   // For unit types with no verifiable artifact (null path), the parent directory
   // is missing on disk — treat as stale completion state so the key gets evicted (#313).
@@ -208,23 +270,37 @@ export function verifyExpectedArtifact(
   // plan has no tasks, creating an infinite skip loop (#699).
   if (unitType === "plan-slice") {
     const planContent = readFileSync(absPath, "utf-8");
-    if (!/^- \[[xX ]\] \*\*T\d+:/m.test(planContent)) return false;
+    // Accept checkbox-style (- [x] **T01: ...) or heading-style (### T01 -- / ### T01: / ### T01 —)
+    const hasCheckboxTask = /^- \[[xX ]\] \*\*T\d+:/m.test(planContent);
+    const hasHeadingTask = /^#{2,4}\s+T\d+\s*(?:--|—|:)/m.test(planContent);
+    if (!hasCheckboxTask && !hasHeadingTask) return false;
   }
 
-  // execute-task must also have its checkbox marked [x] in the slice plan
+  // execute-task: DB status is authoritative. Fall back to heading-style plan
+  // detection when the DB is unavailable (unmigrated projects).
   if (unitType === "execute-task") {
-    const parts = unitId.split("/");
-    const mid = parts[0];
-    const sid = parts[1];
-    const tid = parts[2];
+    const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
     if (mid && sid && tid) {
-      const planAbs = resolveSliceFile(base, mid, sid, "PLAN");
-      if (planAbs && existsSync(planAbs)) {
-        const planContent = readFileSync(planAbs, "utf-8");
-        const escapedTid = tid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const re = new RegExp(`^- \\[[xX]\\] \\*\\*${escapedTid}:`, "m");
-        if (!re.test(planContent)) return false;
+      const dbTask = getTask(mid, sid, tid);
+      if (dbTask) {
+        // DB available — trust it
+        if (dbTask.status !== "complete" && dbTask.status !== "done") return false;
+      } else if (!isDbAvailable()) {
+        // LEGACY: Pre-migration fallback for projects without DB.
+        // Fall back to plan heading check (format detection, not reconciliation).
+        // Heading-style entries (### T01 --) count as verified because the
+        // summary file existence (checked above) is the real signal.
+        const planAbs = resolveSliceFile(base, mid, sid, "PLAN");
+        if (planAbs && existsSync(planAbs)) {
+          const planContent = readFileSync(planAbs, "utf-8");
+          const escapedTid = tid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const hdRe = new RegExp(`^#{2,4}\\s+${escapedTid}\\s*(?:--|—|:)`, "m");
+          const cbRe = new RegExp(`^- \\[[xX]\\] \\*\\*${escapedTid}:`, "m");
+          if (!hdRe.test(planContent) && !cbRe.test(planContent)) return false;
+        }
       }
+      // else: DB available but task not found — summary file exists (checked above),
+      // so treat as verified (task may not be imported yet)
     }
   }
 
@@ -233,18 +309,30 @@ export function verifyExpectedArtifact(
   // but omitted T{tid}-PLAN.md files would be marked complete, causing execute-task
   // to dispatch with a missing task plan (see issue #739).
   if (unitType === "plan-slice") {
-    const parts = unitId.split("/");
-    const mid = parts[0];
-    const sid = parts[1];
+    const { milestone: mid, slice: sid } = parseUnitId(unitId);
     if (mid && sid) {
       try {
-        const planContent = readFileSync(absPath, "utf-8");
-        const plan = parsePlan(planContent);
-        const tasksDir = resolveTasksDir(base, mid, sid);
-        if (plan.tasks.length > 0 && tasksDir) {
-          for (const task of plan.tasks) {
-            const taskPlanFile = join(tasksDir, `${task.id}-PLAN.md`);
-            if (!existsSync(taskPlanFile)) return false;
+        // DB primary path — get task IDs to verify task plan files exist
+        let taskIds: string[] | null = null;
+        if (isDbAvailable()) {
+          const tasks = getSliceTasks(mid, sid);
+          if (tasks.length > 0) taskIds = tasks.map(t => t.id);
+        }
+
+        if (!taskIds) {
+          // LEGACY: DB unavailable or no tasks in DB — parse plan file for task IDs
+          const planContent = readFileSync(absPath, "utf-8");
+          const plan = parseLegacyPlan(planContent);
+          if (plan.tasks.length > 0) taskIds = plan.tasks.map((t: { id: string }) => t.id);
+        }
+
+        if (taskIds && taskIds.length > 0) {
+          const tasksDir = resolveTasksDir(base, mid, sid);
+          if (tasksDir) {
+            for (const tid of taskIds) {
+              const taskPlanFile = join(tasksDir, `${tid}-PLAN.md`);
+              if (!existsSync(taskPlanFile)) return false;
+            }
           }
         }
       } catch {
@@ -253,38 +341,46 @@ export function verifyExpectedArtifact(
     }
   }
 
-  // complete-slice must also produce a UAT file AND mark the slice [x] in the roadmap.
-  // Without the roadmap check, a crash after writing SUMMARY+UAT but before updating
-  // the roadmap causes an infinite skip loop: the idempotency key says "done" but the
-  // state machine keeps returning the same complete-slice unit (roadmap still shows
-  // the slice incomplete), so dispatchNextUnit recurses forever.
+  // complete-slice: DB status is authoritative for whether the slice is done.
+  // Fall back to file-based check (roadmap [x]) when DB is unavailable.
   if (unitType === "complete-slice") {
-    const parts = unitId.split("/");
-    const mid = parts[0];
-    const sid = parts[1];
+    const { milestone: mid, slice: sid } = parseUnitId(unitId);
     if (mid && sid) {
       const dir = resolveSlicePath(base, mid, sid);
       if (dir) {
         const uatPath = join(dir, buildSliceFileName(sid, "UAT"));
         if (!existsSync(uatPath)) return false;
       }
-      // Verify the roadmap has the slice marked [x]. If not, the completion
-      // record is stale — the unit must re-run to update the roadmap.
-      const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-      if (roadmapFile && existsSync(roadmapFile)) {
-        try {
-          const roadmapContent = readFileSync(roadmapFile, "utf-8");
-          const roadmap = parseRoadmap(roadmapContent);
-          const slice = roadmap.slices.find((s) => s.id === sid);
-          if (slice && !slice.done) return false;
-        } catch {
-          // Corrupt/unparseable roadmap — fail verification so the unit
-          // re-runs and has a chance to fix the roadmap. Silently passing
-          // here could advance past an incomplete slice.
-          return false;
+
+      const dbSlice = getSlice(mid, sid);
+      if (dbSlice) {
+        // DB available — trust it
+        if (dbSlice.status !== "complete") return false;
+      } else if (!isDbAvailable()) {
+        // LEGACY: Pre-migration fallback for projects without DB.
+        // Fall back to roadmap checkbox check via parsers-legacy
+        const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
+        if (roadmapFile && existsSync(roadmapFile)) {
+          try {
+            const roadmapContent = readFileSync(roadmapFile, "utf-8");
+            const roadmap = parseLegacyRoadmap(roadmapContent);
+            const slice = roadmap.slices.find((s) => s.id === sid);
+            if (slice && !slice.done) return false;
+          } catch {
+            return false;
+          }
         }
       }
+      // else: DB available but slice not found — summary + UAT exist,
+      // treat as verified (slice may not be imported yet)
     }
+  }
+
+  // complete-milestone must have produced implementation artifacts (#1703).
+  // A milestone with only .gsd/ plan files and zero implementation code is
+  // not genuinely complete — the LLM wrote plan files but skipped actual work.
+  if (unitType === "complete-milestone") {
+    if (!hasImplementationArtifacts(base)) return false;
   }
 
   return true;
@@ -315,105 +411,50 @@ export function writeBlockerPlaceholder(
     `Review and replace this file before relying on downstream artifacts.`,
   ].join("\n");
   writeFileSync(absPath, content, "utf-8");
+
+  // Mark the task as complete in the DB so verifyExpectedArtifact passes.
+  // Without this, the DB status stays "pending" and the dispatch loop
+  // re-derives the same task indefinitely (#2531).
+  if (unitType === "execute-task" && isDbAvailable()) {
+    const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
+    if (mid && sid && tid) {
+      try { updateTaskStatus(mid, sid, tid, "complete", new Date().toISOString()); } catch { /* non-fatal */ }
+    }
+  }
+
   return diagnoseExpectedArtifact(unitType, unitId, base);
 }
 
-export function diagnoseExpectedArtifact(
-  unitType: string,
-  unitId: string,
-  base: string,
-): string | null {
-  const parts = unitId.split("/");
-  const mid = parts[0];
-  const sid = parts[1];
-  switch (unitType) {
-    case "research-milestone":
-      return `${relMilestoneFile(base, mid!, "RESEARCH")} (milestone research)`;
-    case "plan-milestone":
-      return `${relMilestoneFile(base, mid!, "ROADMAP")} (milestone roadmap)`;
-    case "research-slice":
-      return `${relSliceFile(base, mid!, sid!, "RESEARCH")} (slice research)`;
-    case "plan-slice":
-      return `${relSliceFile(base, mid!, sid!, "PLAN")} (slice plan)`;
-    case "execute-task": {
-      const tid = parts[2];
-      return `Task ${tid} marked [x] in ${relSliceFile(base, mid!, sid!, "PLAN")} + summary written`;
-    }
-    case "complete-slice":
-      return `Slice ${sid} marked [x] in ${relMilestoneFile(base, mid!, "ROADMAP")} + summary + UAT written`;
-    case "replan-slice":
-      return `${relSliceFile(base, mid!, sid!, "REPLAN")} + updated ${relSliceFile(base, mid!, sid!, "PLAN")}`;
-    case "rewrite-docs":
-      return "Active overrides resolved in .gsd/OVERRIDES.md + plan documents updated";
-    case "reassess-roadmap":
-      return `${relSliceFile(base, mid!, sid!, "ASSESSMENT")} (roadmap reassessment)`;
-    case "run-uat":
-      return `${relSliceFile(base, mid!, sid!, "UAT-RESULT")} (UAT result)`;
-    case "validate-milestone":
-      return `${relMilestoneFile(base, mid!, "VALIDATION")} (milestone validation report)`;
-    case "complete-milestone":
-      return `${relMilestoneFile(base, mid!, "SUMMARY")} (milestone summary)`;
-    default:
-      return null;
-  }
-}
-
-// ─── Skip / Blocker Artifact Generation ───────────────────────────────────────
+// ─── Merge State Reconciliation ───────────────────────────────────────────────
 
 /**
- * Write skip artifacts for a stuck execute-task: a blocker task summary and
- * the [x] checkbox in the slice plan. Returns true if artifacts were written.
+ * Best-effort abort of a pending merge/squash and hard-reset to HEAD.
+ * Handles both real merges (MERGE_HEAD) and squash merges (SQUASH_MSG).
  */
-export function skipExecuteTask(
-  base: string,
-  mid: string,
-  sid: string,
-  tid: string,
-  status: { summaryExists: boolean; taskChecked: boolean },
-  reason: string,
-  maxAttempts: number,
-): boolean {
-  // Write a blocker task summary if missing.
-  if (!status.summaryExists) {
-    const tasksDir = resolveTasksDir(base, mid, sid);
-    const sDir = resolveSlicePath(base, mid, sid);
-    const targetDir = tasksDir ?? (sDir ? join(sDir, "tasks") : null);
-    if (!targetDir) return false;
-    if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
-    const summaryPath = join(targetDir, buildTaskFileName(tid, "SUMMARY"));
-    const content = [
-      `# BLOCKER — task skipped by auto-mode recovery`,
-      ``,
-      `Task \`${tid}\` in slice \`${sid}\` (milestone \`${mid}\`) failed to complete after ${reason} recovery exhausted ${maxAttempts} attempts.`,
-      ``,
-      `This placeholder was written by auto-mode so the pipeline can advance.`,
-      `Review this task manually and replace this file with a real summary.`,
-    ].join("\n");
-    writeFileSync(summaryPath, content, "utf-8");
-  }
-
-  // Mark [x] in the slice plan if not already checked.
-  if (!status.taskChecked) {
-    const planAbs = resolveSliceFile(base, mid, sid, "PLAN");
-    if (planAbs && existsSync(planAbs)) {
-      const planContent = readFileSync(planAbs, "utf-8");
-      const escapedTid = tid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const re = new RegExp(`^(- \\[) \\] (\\*\\*${escapedTid}:)`, "m");
-      if (re.test(planContent)) {
-        writeFileSync(planAbs, planContent.replace(re, "$1x] $2"), "utf-8");
-      } else {
-        // Regex didn't match — checkbox format differs from expected pattern.
-        // Return false so callers know the plan was NOT updated and can
-        // fall through to other recovery strategies instead of assuming success.
-        return false;
-      }
+function abortAndResetMerge(
+  basePath: string,
+  hasMergeHead: boolean,
+  squashMsgPath: string,
+): void {
+  if (hasMergeHead) {
+    try {
+      nativeMergeAbort(basePath);
+    } catch {
+      /* best-effort */
+    }
+  } else if (squashMsgPath) {
+    try {
+      unlinkSync(squashMsgPath);
+    } catch {
+      /* best-effort */
     }
   }
-
-  return true;
+  try {
+    nativeResetHard(basePath);
+  } catch {
+    /* best-effort */
+  }
 }
-
-// ─── Merge State Reconciliation ───────────────────────────────────────────────
 
 /**
  * Detect leftover merge state from a prior session and reconcile it.
@@ -436,11 +477,17 @@ export function reconcileMergeState(
   if (conflictedFiles.length === 0) {
     // All conflicts resolved — finalize the merge/squash commit
     try {
-      nativeCommit(basePath, ""); // --no-edit equivalent: use empty message placeholder
-      const mode = hasMergeHead ? "merge" : "squash commit";
-      ctx.ui.notify(`Finalized leftover ${mode} from prior session.`, "info");
-    } catch {
-      // Commit may already exist; non-fatal
+      const commitSha = nativeCommit(basePath, ""); // --no-edit equivalent: use empty message placeholder
+      if (commitSha) {
+        const mode = hasMergeHead ? "merge" : "squash commit";
+        ctx.ui.notify(`Finalized leftover ${mode} from prior session.`, "info");
+      } else {
+        ctx.ui.notify("No new commit needed for leftover merge/squash state — already committed.", "info");
+      }
+    } catch (err) {
+      const errorMessage = getErrorMessage(err);
+      ctx.ui.notify(`Failed to finalize leftover merge/squash commit: ${errorMessage}`, "error");
+      return false;
     }
   } else {
     // Still conflicted — try auto-resolving .gsd/ state file conflicts (#530)
@@ -471,24 +518,7 @@ export function reconcileMergeState(
         }
       }
       if (!resolved) {
-        if (hasMergeHead) {
-          try {
-            nativeMergeAbort(basePath);
-          } catch {
-            /* best-effort */
-          }
-        } else if (hasSquashMsg) {
-          try {
-            unlinkSync(squashMsgPath);
-          } catch {
-            /* best-effort */
-          }
-        }
-        try {
-          nativeResetHard(basePath);
-        } catch {
-          /* best-effort */
-        }
+        abortAndResetMerge(basePath, hasMergeHead, squashMsgPath);
         ctx.ui.notify(
           "Detected leftover merge state — auto-resolve failed, cleaned up. Re-deriving state.",
           "warning",
@@ -496,24 +526,7 @@ export function reconcileMergeState(
       }
     } else {
       // Code conflicts present — abort and reset
-      if (hasMergeHead) {
-        try {
-          nativeMergeAbort(basePath);
-        } catch {
-          /* best-effort */
-        }
-      } else if (hasSquashMsg) {
-        try {
-          unlinkSync(squashMsgPath);
-        } catch {
-          /* best-effort */
-        }
-      }
-      try {
-        nativeResetHard(basePath);
-      } catch {
-        /* best-effort */
-      }
+      abortAndResetMerge(basePath, hasMergeHead, squashMsgPath);
       ctx.ui.notify(
         "Detected leftover merge state with unresolved conflicts — cleaned up. Re-deriving state.",
         "warning",
@@ -521,83 +534,6 @@ export function reconcileMergeState(
     }
   }
   return true;
-}
-
-// ─── Self-Heal Runtime Records ────────────────────────────────────────────────
-
-/**
- * Self-heal: scan runtime records in .gsd/ and clear stale ones.
- * Clears dispatched records older than 1 hour (process crashed before
- * completing the unit). deriveState() handles re-derivation — no need
- * for completion key persistence here.
- */
-export async function selfHealRuntimeRecords(
-  base: string,
-  ctx: ExtensionContext,
-): Promise<void> {
-  try {
-    const { listUnitRuntimeRecords } = await import("./unit-runtime.js");
-    const records = listUnitRuntimeRecords(base);
-    let healed = 0;
-    const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
-    const now = Date.now();
-    for (const record of records) {
-      const { unitType, unitId } = record;
-
-      // Case 0: complete-slice with SUMMARY + UAT but unchecked roadmap (#1350).
-      // If a complete-slice was interrupted after writing artifacts but before
-      // flipping the roadmap checkbox, the verification fails and the dispatch
-      // loop relaunches the same unit forever. Auto-fix the checkbox.
-      if (unitType === "complete-slice") {
-        const { milestone: mid, slice: sid } = parseUnitId(unitId);
-        if (mid && sid) {
-          const dir = resolveSlicePath(base, mid, sid);
-          if (dir) {
-            const summaryPath = join(dir, buildSliceFileName(sid, "SUMMARY"));
-            const uatPath = join(dir, buildSliceFileName(sid, "UAT"));
-            if (existsSync(summaryPath) && existsSync(uatPath)) {
-              const roadmapFile = resolveMilestoneFile(base, mid, "ROADMAP");
-              if (roadmapFile && existsSync(roadmapFile)) {
-                try {
-                  const roadmapContent = readFileSync(roadmapFile, "utf-8");
-                  const roadmap = parseRoadmap(roadmapContent);
-                  const slice = (roadmap.slices ?? []).find(s => s.id === sid);
-                  if (slice && !slice.done) {
-                    // Auto-fix: flip the checkbox using shared utility
-                    if (markSliceDoneInRoadmap(base, mid, sid)) {
-                      ctx.ui.notify(
-                        `Self-heal: marked ${sid} done in roadmap (SUMMARY + UAT exist but checkbox was stale).`,
-                        "info",
-                      );
-                    }
-                  }
-                } catch {
-                  // Roadmap parse failure — don't block self-heal
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Clear stale dispatched records (dispatched > 1h ago, process crashed)
-      const age = now - (record.startedAt ?? 0);
-      if (record.phase === "dispatched" && age > STALE_THRESHOLD_MS) {
-        clearUnitRuntimeRecord(base, unitType, unitId);
-        healed++;
-        continue;
-      }
-    }
-    if (healed > 0) {
-      ctx.ui.notify(
-        `Self-heal: cleared ${healed} stale runtime record(s).`,
-        "info",
-      );
-    }
-  } catch (e) {
-    // Non-fatal — self-heal should never block auto-mode start
-    void e;
-  }
 }
 
 // ─── Loop Remediation ─────────────────────────────────────────────────────────
@@ -611,20 +547,14 @@ export function buildLoopRemediationSteps(
   unitId: string,
   base: string,
 ): string | null {
-  const parts = unitId.split("/");
-  const mid = parts[0];
-  const sid = parts[1];
-  const tid = parts[2];
+  const { milestone: mid, slice: sid, task: tid } = parseUnitId(unitId);
   switch (unitType) {
     case "execute-task": {
       if (!mid || !sid || !tid) break;
-      const planRel = relSliceFile(base, mid, sid, "PLAN");
-      const summaryRel = relTaskFile(base, mid, sid, tid, "SUMMARY");
       return [
-        `   1. Write ${summaryRel} (even a partial summary is sufficient to unblock the pipeline)`,
-        `   2. Mark ${tid} [x] in ${planRel}: change "- [ ] **${tid}:" → "- [x] **${tid}:"`,
-        `   3. Run \`gsd doctor\` to reconcile .gsd/ state`,
-        `   4. Resume auto-mode — it will pick up from the next task`,
+        `   1. Run \`gsd undo-task ${tid}\` to reset the task state`,
+        `   2. Resume auto-mode — it will re-execute the task`,
+        `   3. If the task keeps failing, run \`gsd recover\` to rebuild DB state from disk`,
       ].join("\n");
     }
     case "plan-slice":
@@ -636,17 +566,16 @@ export function buildLoopRemediationSteps(
           : relSliceFile(base, mid, sid, "RESEARCH");
       return [
         `   1. Write ${artifactRel} manually (or with the LLM in interactive mode)`,
-        `   2. Run \`gsd doctor\` to reconcile .gsd/ state`,
+        `   2. Run \`gsd recover\` to rebuild DB state from disk`,
         `   3. Resume auto-mode`,
       ].join("\n");
     }
     case "complete-slice": {
       if (!mid || !sid) break;
       return [
-        `   1. Write the slice summary and UAT file for ${sid} in ${relSlicePath(base, mid, sid)}`,
-        `   2. Mark ${sid} [x] in ${relMilestoneFile(base, mid, "ROADMAP")}`,
-        `   3. Run \`gsd doctor\` to reconcile .gsd/ state`,
-        `   4. Resume auto-mode`,
+        `   1. Run \`gsd reset-slice ${sid}\` to reset the slice and all its tasks`,
+        `   2. Resume auto-mode — it will re-execute incomplete tasks and re-complete the slice`,
+        `   3. If the slice keeps failing, run \`gsd recover\` to rebuild DB state from disk`,
       ].join("\n");
     }
     case "validate-milestone": {
@@ -654,7 +583,7 @@ export function buildLoopRemediationSteps(
       const artifactRel = relMilestoneFile(base, mid, "VALIDATION");
       return [
         `   1. Write ${artifactRel} with verdict: pass`,
-        `   2. Run \`gsd doctor\``,
+        `   2. Run \`gsd recover\` to rebuild DB state from disk`,
         `   3. Resume auto-mode`,
       ].join("\n");
     }

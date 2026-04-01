@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { loadRegistry } from "../workflow-templates.js";
+import { resolveProjectRoot } from "../worktree.js";
 
 const gsdHome = process.env.GSD_HOME || join(homedir(), ".gsd");
 
@@ -14,7 +15,7 @@ export interface GsdCommandDefinition {
 type CompletionMap = Record<string, readonly GsdCommandDefinition[]>;
 
 export const GSD_COMMAND_DESCRIPTION =
-  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|queue|quick|capture|triage|dispatch|history|undo|rate|skip|export|cleanup|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|parallel|cmux|park|unpark|init|setup|inspect|extensions|update";
+  "GSD — Get Shit Done: /gsd help|start|templates|next|auto|stop|pause|status|widget|visualize|queue|quick|discuss|capture|triage|dispatch|history|undo|undo-task|reset-slice|rate|skip|export|cleanup|mode|prefs|config|keys|hooks|run-hook|skill-health|doctor|logs|forensics|changelog|migrate|remote|steer|knowledge|new-milestone|parallel|cmux|park|unpark|init|setup|inspect|extensions|update|fast|mcp|rethink|codebase";
 
 export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "help", desc: "Categorized command reference with descriptions" },
@@ -34,6 +35,8 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "dispatch", desc: "Dispatch a specific phase directly" },
   { cmd: "history", desc: "View execution history" },
   { cmd: "undo", desc: "Revert last completed unit" },
+  { cmd: "undo-task", desc: "Reset a specific task's completion state (DB + markdown)" },
+  { cmd: "reset-slice", desc: "Reset a slice and all its tasks (DB + markdown)" },
   { cmd: "rate", desc: "Rate last unit's model tier (over/ok/under) — improves adaptive routing" },
   { cmd: "skip", desc: "Prevent a unit from auto-mode dispatch" },
   { cmd: "export", desc: "Export milestone/slice results" },
@@ -56,7 +59,7 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "inspect", desc: "Show SQLite DB diagnostics" },
   { cmd: "knowledge", desc: "Add persistent project knowledge (rule, pattern, or lesson)" },
   { cmd: "new-milestone", desc: "Create a milestone from a specification document (headless)" },
-  { cmd: "parallel", desc: "Parallel milestone orchestration (start, status, stop, merge)" },
+  { cmd: "parallel", desc: "Parallel milestone orchestration (start, status, stop, merge, watch)" },
   { cmd: "cmux", desc: "Manage cmux integration (status, sidebar, notifications, splits)" },
   { cmd: "park", desc: "Park a milestone — skip without deleting" },
   { cmd: "unpark", desc: "Reactivate a parked milestone" },
@@ -64,6 +67,11 @@ export const TOP_LEVEL_SUBCOMMANDS: readonly GsdCommandDefinition[] = [
   { cmd: "start", desc: "Start a workflow template (bugfix, spike, feature, etc.)" },
   { cmd: "templates", desc: "List available workflow templates" },
   { cmd: "extensions", desc: "Manage extensions (list, enable, disable, info)" },
+  { cmd: "fast", desc: "Toggle OpenAI service tier (on/off/flex/status)" },
+  { cmd: "mcp", desc: "MCP server status and connectivity check (status, check <server>)" },
+  { cmd: "rethink", desc: "Conversational project reorganization — reorder, park, discard, add milestones" },
+  { cmd: "workflow", desc: "Custom workflow lifecycle (new, run, list, validate, pause, resume)" },
+  { cmd: "codebase", desc: "Generate and manage codebase map (.gsd/CODEBASE.md)" },
 ];
 
 const NESTED_COMPLETIONS: CompletionMap = {
@@ -74,6 +82,13 @@ const NESTED_COMPLETIONS: CompletionMap = {
   next: [
     { cmd: "--verbose", desc: "Show detailed step output" },
     { cmd: "--dry-run", desc: "Preview next step without executing" },
+    { cmd: "--debug", desc: "Enable debug logging" },
+  ],
+  widget: [
+    { cmd: "full", desc: "Full widget display" },
+    { cmd: "small", desc: "Compact widget display" },
+    { cmd: "min", desc: "Minimal widget display" },
+    { cmd: "off", desc: "Hide widget" },
   ],
   mode: [
     { cmd: "global", desc: "Edit global workflow mode" },
@@ -86,6 +101,7 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "pause", desc: "Pause a specific worker" },
     { cmd: "resume", desc: "Resume a paused worker" },
     { cmd: "merge", desc: "Merge completed milestone branches" },
+    { cmd: "watch", desc: "Live TUI dashboard monitoring all workers" },
   ],
   setup: [
     { cmd: "llm", desc: "Configure LLM provider settings" },
@@ -136,8 +152,11 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "--html --all", desc: "Export all milestones as HTML" },
   ],
   cleanup: [
-    { cmd: "branches", desc: "Remove merged milestone branches" },
+    { cmd: "branches", desc: "Remove merged milestone and legacy branches" },
     { cmd: "snapshots", desc: "Remove old execution snapshots" },
+    { cmd: "worktrees", desc: "Remove merged/safe-to-delete worktrees" },
+    { cmd: "projects", desc: "Audit orphaned ~/.gsd/projects/ state directories" },
+    { cmd: "projects --fix", desc: "Delete orphaned project state directories (cannot be undone)" },
   ],
   knowledge: [
     { cmd: "rule", desc: "Add a project rule (always/never do X)" },
@@ -166,6 +185,16 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "disable", desc: "Disable an extension" },
     { cmd: "info", desc: "Show extension details" },
   ],
+  fast: [
+    { cmd: "on", desc: "Priority tier (2x cost, faster)" },
+    { cmd: "off", desc: "Disable service tier" },
+    { cmd: "flex", desc: "Flex tier (0.5x cost, slower)" },
+    { cmd: "status", desc: "Show current service tier setting" },
+  ],
+  mcp: [
+    { cmd: "status", desc: "Show all MCP server statuses (default)" },
+    { cmd: "check", desc: "Detailed status for a specific server" },
+  ],
   doctor: [
     { cmd: "fix", desc: "Auto-fix detected issues" },
     { cmd: "heal", desc: "AI-driven deep healing" },
@@ -188,6 +217,22 @@ const NESTED_COMPLETIONS: CompletionMap = {
     { cmd: "over", desc: "Model was overqualified for this task" },
     { cmd: "ok", desc: "Model was appropriate for this task" },
     { cmd: "under", desc: "Model was underqualified for this task" },
+  ],
+  workflow: [
+    { cmd: "new", desc: "Create a new workflow definition (via skill)" },
+    { cmd: "run", desc: "Create a run and start auto-mode" },
+    { cmd: "list", desc: "List workflow runs" },
+    { cmd: "validate", desc: "Validate a workflow definition YAML" },
+    { cmd: "pause", desc: "Pause custom workflow auto-mode" },
+    { cmd: "resume", desc: "Resume paused custom workflow auto-mode" },
+  ],
+  codebase: [
+    { cmd: "generate", desc: "Generate or regenerate CODEBASE.md" },
+    { cmd: "generate --max-files", desc: "Generate with custom file limit (default: 500)" },
+    { cmd: "update", desc: "Incremental update (preserves descriptions)" },
+    { cmd: "update --max-files", desc: "Update with custom file limit" },
+    { cmd: "stats", desc: "Show file count, description coverage, and generation time" },
+    { cmd: "help", desc: "Show usage and available subcommands" },
   ],
 };
 
@@ -290,6 +335,28 @@ export function getGsdArgumentCompletions(prefix: string) {
 
   if (command === "undo" && parts.length <= 2) {
     return [{ value: "undo --force", label: "--force", description: "Skip confirmation prompt" }];
+  }
+
+  // Workflow definition-name completion for `workflow run <name>` and `workflow validate <name>`
+  if (command === "workflow" && (subcommand === "run" || subcommand === "validate") && parts.length <= 3) {
+    try {
+      const defsDir = join(resolveProjectRoot(process.cwd()), ".gsd", "workflow-defs");
+      if (existsSync(defsDir)) {
+        return readdirSync(defsDir)
+          .filter((f) => f.endsWith(".yaml") && f.startsWith(third))
+          .map((f) => {
+            const name = f.replace(/\.yaml$/, "");
+            return {
+              value: `workflow ${subcommand} ${name}`,
+              label: name,
+              description: `Workflow definition: ${name}`,
+            };
+          });
+      }
+    } catch {
+      // ignore filesystem errors during completion
+    }
+    return [];
   }
 
   const nested = NESTED_COMPLETIONS[command];

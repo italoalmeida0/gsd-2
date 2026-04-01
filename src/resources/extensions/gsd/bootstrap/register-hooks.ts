@@ -6,35 +6,70 @@ import { isToolCallEventType } from "@gsd/pi-coding-agent";
 import { buildMilestoneFileName, resolveMilestonePath, resolveSliceFile, resolveSlicePath } from "../paths.js";
 import { buildBeforeAgentStartResult } from "./system-context.js";
 import { handleAgentEnd } from "./agent-end-recovery.js";
-import { clearDiscussionFlowState, isDepthVerified, isQueuePhaseActive, markDepthVerified, resetWriteGateState, shouldBlockContextWrite } from "./write-gate.js";
+import { clearDiscussionFlowState, isDepthVerified, isQueuePhaseActive, markDepthVerified, resetWriteGateState, shouldBlockContextWrite, shouldBlockQueueExecution } from "./write-gate.js";
+import { isBlockedStateFile, isBashWriteToStateFile, BLOCKED_WRITE_ERROR } from "../write-intercept.js";
+import { cleanupQuickBranch } from "../quick.js";
 import { getDiscussionMilestoneId } from "../guided-flow.js";
 import { loadToolApiKeys } from "../commands-config.js";
 import { loadFile, saveFile, formatContinue } from "../files.js";
 import { deriveState } from "../state.js";
 import { getAutoDashboardData, isAutoActive, isAutoPaused, markToolEnd, markToolStart } from "../auto.js";
 import { isParallelActive, shutdownParallel } from "../parallel-orchestrator.js";
+import { checkToolCallLoop, resetToolCallLoopGuard } from "./tool-call-loop-guard.js";
 import { saveActivityLog } from "../activity-log.js";
-import { maybeRenderGsdHeader } from "./register-shortcuts.js";
+
+// Skip the welcome screen on the very first session_start — cli.ts already
+// printed it before the TUI launched. Only re-print on /clear (subsequent sessions).
+let isFirstSession = true;
+
+async function syncServiceTierStatus(ctx: ExtensionContext): Promise<void> {
+  const { getEffectiveServiceTier, formatServiceTierFooterStatus } = await import("../service-tier.js");
+  ctx.ui.setStatus("gsd-fast", formatServiceTierFooterStatus(getEffectiveServiceTier(), ctx.model?.id));
+}
 
 export function registerHooks(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     resetWriteGateState();
-    maybeRenderGsdHeader(ctx);
-    loadToolApiKeys();
+    resetToolCallLoopGuard();
+    await syncServiceTierStatus(ctx);
+
+    // Apply show_token_cost preference (#1515)
     try {
-      const [{ getRemoteConfigStatus }, { getLatestPromptSummary }] = await Promise.all([
-        import("../../remote-questions/config.js"),
-        import("../../remote-questions/status.js"),
-      ]);
-      const status = getRemoteConfigStatus();
-      const latest = getLatestPromptSummary();
-      if (!status.includes("not configured")) {
-        const suffix = latest ? `\nLast remote prompt: ${latest.id} (${latest.status})` : "";
-        ctx.ui.notify(`${status}${suffix}`, status.includes("disabled") ? "warning" : "info");
-      }
-    } catch {
-      // ignore
+      const { loadEffectiveGSDPreferences } = await import("../preferences.js");
+      const prefs = loadEffectiveGSDPreferences();
+      process.env.GSD_SHOW_TOKEN_COST = prefs?.preferences.show_token_cost ? "1" : "";
+    } catch { /* non-fatal */ }
+    if (isFirstSession) {
+      isFirstSession = false;
+    } else {
+      try {
+        const gsdBinPath = process.env.GSD_BIN_PATH;
+        if (gsdBinPath) {
+          const { dirname } = await import("node:path");
+          const { printWelcomeScreen } = await import(
+            join(dirname(gsdBinPath), "welcome-screen.js")
+          ) as { printWelcomeScreen: (opts: { version: string; modelName?: string; provider?: string; remoteChannel?: string }) => void };
+
+          let remoteChannel: string | undefined;
+          try {
+            const { resolveRemoteConfig } = await import("../../remote-questions/config.js");
+            const rc = resolveRemoteConfig();
+            if (rc) remoteChannel = rc.channel;
+          } catch { /* non-fatal */ }
+
+          printWelcomeScreen({ version: process.env.GSD_VERSION || "0.0.0", remoteChannel });
+        }
+      } catch { /* non-fatal */ }
     }
+    loadToolApiKeys();
+  });
+
+  pi.on("session_switch", async (_event, ctx) => {
+    resetWriteGateState();
+    resetToolCallLoopGuard();
+    clearDiscussionFlowState();
+    await syncServiceTierStatus(ctx);
+    loadToolApiKeys();
   });
 
   pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
@@ -42,7 +77,19 @@ export function registerHooks(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async (event, ctx: ExtensionContext) => {
+    resetToolCallLoopGuard();
     await handleAgentEnd(pi, event, ctx);
+  });
+
+  // Squash-merge quick-task branch back to the original branch after the
+  // agent turn completes (#2668). cleanupQuickBranch is a no-op when no
+  // quick-return state is pending, so this is safe to call on every turn.
+  pi.on("turn_end", async () => {
+    try {
+      cleanupQuickBranch();
+    } catch {
+      // Best-effort: don't break the turn lifecycle if cleanup fails.
+    }
   });
 
   pi.on("session_before_compact", async () => {
@@ -97,7 +144,51 @@ export function registerHooks(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event) => {
+    // ── Loop guard: block repeated identical tool calls ──
+    const loopCheck = checkToolCallLoop(event.toolName, event.input as Record<string, unknown>);
+    if (loopCheck.block) {
+      return { block: true, reason: loopCheck.reason };
+    }
+
+    // ── Queue-mode execution guard (#2545): block source-code mutations ──
+    // When /gsd queue is active, the agent should only create milestones,
+    // not execute work. Block write/edit to non-.gsd/ paths and bash commands
+    // that would modify files.
+    if (isQueuePhaseActive()) {
+      let queueInput = "";
+      if (isToolCallEventType("write", event)) {
+        queueInput = event.input.path;
+      } else if (isToolCallEventType("edit", event)) {
+        queueInput = event.input.path;
+      } else if (isToolCallEventType("bash", event)) {
+        queueInput = event.input.command;
+      }
+      const queueGuard = shouldBlockQueueExecution(event.toolName, queueInput, true);
+      if (queueGuard.block) return queueGuard;
+    }
+
+    // ── Single-writer engine: block direct writes to STATE.md ──────────
+    // Covers write, edit, and bash tools to prevent bypass vectors.
+    if (isToolCallEventType("write", event)) {
+      if (isBlockedStateFile(event.input.path)) {
+        return { block: true, reason: BLOCKED_WRITE_ERROR };
+      }
+    }
+
+    if (isToolCallEventType("edit", event)) {
+      if (isBlockedStateFile(event.input.path)) {
+        return { block: true, reason: BLOCKED_WRITE_ERROR };
+      }
+    }
+
+    if (isToolCallEventType("bash", event)) {
+      if (isBashWriteToStateFile(event.input.command)) {
+        return { block: true, reason: BLOCKED_WRITE_ERROR };
+      }
+    }
+
     if (!isToolCallEventType("write", event)) return;
+
     const result = shouldBlockContextWrite(
       event.toolName,
       event.input.path,
@@ -111,7 +202,8 @@ export function registerHooks(pi: ExtensionAPI): void {
   pi.on("tool_result", async (event) => {
     if (event.toolName !== "ask_user_questions") return;
     const milestoneId = getDiscussionMilestoneId();
-    if (!milestoneId) return;
+    const queueActive = isQueuePhaseActive();
+    if (!milestoneId && !queueActive) return;
 
     const details = event.details as any;
     if (details?.cancelled || !details?.response) return;
@@ -123,6 +215,8 @@ export function registerHooks(pi: ExtensionAPI): void {
         break;
       }
     }
+
+    if (!milestoneId) return;
 
     const basePath = process.cwd();
     const milestoneDir = resolveMilestonePath(basePath, milestoneId);
@@ -163,5 +257,20 @@ export function registerHooks(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", async (event) => {
     markToolEnd(event.toolCallId);
   });
-}
 
+  pi.on("model_select", async (_event, ctx) => {
+    await syncServiceTierStatus(ctx);
+  });
+
+  pi.on("before_provider_request", async (event) => {
+    const modelId = event.model?.id;
+    if (!modelId) return;
+    const { getEffectiveServiceTier, supportsServiceTier } = await import("../service-tier.js");
+    const tier = getEffectiveServiceTier();
+    if (!tier || !supportsServiceTier(modelId)) return;
+    const payload = event.payload as Record<string, unknown> | null;
+    if (!payload || typeof payload !== "object") return;
+    payload.service_tier = tier;
+    return payload;
+  });
+}

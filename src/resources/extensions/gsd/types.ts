@@ -11,6 +11,7 @@ export type Phase =
   | "discussing"
   | "researching"
   | "planning"
+  | "evaluating-gates"
   | "executing"
   | "verifying"
   | "summarizing"
@@ -156,6 +157,8 @@ export interface Summary {
   whatHappened: string;
   deviations: string;
   filesModified: FileModified[];
+  followUps: string;
+  knownLimitations: string;
 }
 
 // ─── Continue-Here ─────────────────────────────────────────────────────────
@@ -246,6 +249,8 @@ export interface GSDState {
     slices?: { done: number; total: number };
     tasks?: { done: number; total: number };
   };
+  /** When phase=complete, holds the last completed milestone (instead of activeMilestone). */
+  lastCompletedMilestone?: ActiveRef | null;
 }
 
 // ─── Post-Unit Hook Types ─────────────────────────────────────────────────
@@ -404,6 +409,8 @@ export interface HookStatusEntry {
 
 // ─── Database Types (Decisions & Requirements) ────────────────────────────
 
+export type DecisionMadeBy = "human" | "agent" | "collaborative";
+
 export interface Decision {
   seq: number; // auto-increment primary key
   id: string; // e.g. "D001"
@@ -413,6 +420,7 @@ export interface Decision {
   choice: string; // the specific choice made
   rationale: string; // why this choice
   revisable: string; // whether/when revisable
+  made_by: DecisionMadeBy; // who made the decision: human, agent, or collaborative
   superseded_by: string | null; // ID of superseding decision, or null
 }
 
@@ -495,4 +503,91 @@ export interface BrowserFlowResult {
   checksTotal: number;
   checksPassed: number;
   duration: number;
+}
+
+// ─── Complete Task Params (gsd_complete_task tool input) ─────────────────
+
+export interface CompleteTaskParams {
+  taskId: string;
+  sliceId: string;
+  milestoneId: string;
+  oneLiner: string;
+  narrative: string;
+  verification: string;
+  keyFiles: string[];
+  keyDecisions: string[];
+  deviations: string;
+  knownIssues: string;
+  blockerDiscovered: boolean;
+  verificationEvidence: Array<{
+    command: string;
+    exitCode: number;
+    verdict: string;
+    durationMs: number;
+  }>;
+  /** Optional caller-provided identity for audit trail */
+  actorName?: string;
+  /** Optional caller-provided reason this action was triggered */
+  triggerReason?: string;
+}
+
+// ─── Complete Slice Params (gsd_complete_slice tool input) ───────────────
+
+export interface CompleteSliceParams {
+  sliceId: string;
+  milestoneId: string;
+  sliceTitle: string;
+  oneLiner: string;
+  narrative: string;
+  verification: string;
+  keyFiles: string[];
+  keyDecisions: string[];
+  patternsEstablished: string[];
+  observabilitySurfaces: string[];
+  deviations: string;
+  knownLimitations: string;
+  followUps: string;
+  requirementsAdvanced: Array<{ id: string; how: string }>;
+  requirementsValidated: Array<{ id: string; proof: string }>;
+  requirementsSurfaced: string[];
+  requirementsInvalidated: Array<{ id: string; what: string }>;
+  filesModified: Array<{ path: string; description: string }>;
+  uatContent: string;
+  provides: string[];
+  requires: Array<{ slice: string; provides: string }>;
+  affects: string[];
+  drillDownPaths: string[];
+  /** Optional caller-provided identity for audit trail */
+  actorName?: string;
+  /** Optional caller-provided reason this action was triggered */
+  triggerReason?: string;
+}
+
+// ─── Quality Gates ───────────────────────────────────────────────────────
+
+export type GateId = "Q3" | "Q4" | "Q5" | "Q6" | "Q7" | "Q8" | "MV01" | "MV02" | "MV03" | "MV04";
+export type GateScope = "slice" | "task" | "milestone";
+export type GateStatus = "pending" | "complete" | "omitted";
+export type GateVerdict = "pass" | "flag" | "omitted" | "";
+
+export interface GateRow {
+  milestone_id: string;
+  slice_id: string;
+  gate_id: GateId;
+  scope: GateScope;
+  task_id: string;
+  status: GateStatus;
+  verdict: GateVerdict;
+  rationale: string;
+  findings: string;
+  evaluated_at: string | null;
+}
+
+/** Configuration for parallel quality gate evaluation during slice planning. */
+export interface GateEvaluationConfig {
+  enabled: boolean;
+  /** Which slice-scoped gates to evaluate in parallel. Default: ['Q3', 'Q4']. */
+  slice_gates?: string[];
+  /** Whether to evaluate task-level gates (Q5/Q6/Q7) via reactive-execute. Default: true when enabled. */
+  task_gates?: boolean;
 }

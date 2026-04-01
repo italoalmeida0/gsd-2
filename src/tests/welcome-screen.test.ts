@@ -51,23 +51,35 @@ test('renders cwd hint', () => {
   assert.ok(out.includes('/gsd to begin'), 'hint line missing')
 })
 
-test('skips when not a TTY', () => {
+test('skips when not a TTY', (t) => {
   const chunks: string[] = []
   const original = process.stderr.write.bind(process.stderr)
   ;(process.stderr as any).write = (chunk: string) => { chunks.push(chunk); return true }
   const origIsTTY = (process.stderr as any).isTTY
   ;(process.stderr as any).isTTY = false
 
-  try {
-    printWelcomeScreen({ version: '1.0.0' })
-    assert.equal(chunks.join(''), '', 'should produce no output when not TTY')
-  } finally {
+  t.after(() => {
     ;(process.stderr as any).write = original
     ;(process.stderr as any).isTTY = origIsTTY
-  }
+  });
+
+  printWelcomeScreen({ version: '1.0.0' })
+  assert.equal(chunks.join(''), '', 'should produce no output when not TTY')
 })
 
 test('renders without model or provider', () => {
   const out = strip(capture({ version: '3.0.0' }))
   assert.ok(out.includes('v3.0.0'), 'version missing when no model provided')
+})
+
+test('renders remote channel in tools row', () => {
+  const out = strip(capture({ version: '1.0.0', remoteChannel: 'discord' }))
+  assert.ok(out.includes('Discord'), 'remote channel name missing')
+})
+
+test('omits remote channel when not provided', () => {
+  const out = strip(capture({ version: '1.0.0' }))
+  assert.ok(!out.includes('Discord'), 'should not show Discord when no remote')
+  assert.ok(!out.includes('Slack'), 'should not show Slack when no remote')
+  assert.ok(!out.includes('Telegram'), 'should not show Telegram when no remote')
 })

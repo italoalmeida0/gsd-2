@@ -15,6 +15,7 @@ import {
   applyModeDefaults,
   getIsolationMode,
   parsePreferencesMarkdown,
+  _resetParseWarningFlag,
 } from "../preferences.ts";
 import type { GSDPreferences, GSDModelConfigV2, GSDPhaseModelConfig } from "../preferences.ts";
 
@@ -40,18 +41,16 @@ test("git.merge_to_main produces deprecation warning", () => {
 });
 
 
-test("getIsolationMode defaults to worktree when preferences have no isolation setting", () => {
+test("getIsolationMode defaults to none when preferences have no isolation setting", () => {
   // Validate the default via validatePreferences: when no isolation is set,
-  // preferences.git.isolation is undefined, and getIsolationMode returns "worktree".
-  // We test the function's logic by verifying its documented default.
+  // preferences.git.isolation is undefined, and getIsolationMode returns "none".
+  // Default changed from "worktree" to "none" so GSD works out of the box
+  // without PREFERENCES.md (#2480).
   const { preferences } = validatePreferences({});
   assert.equal(preferences.git?.isolation, undefined, "no isolation in empty prefs");
-  // The function returns "worktree" when prefs?.git?.isolation is not "none" or "branch"
-  // This is a compile-time-verifiable truth from the function body — test it directly
-  // by constructing the same conditions getIsolationMode checks.
   const isolation = preferences.git?.isolation;
-  const expected = isolation === "none" ? "none" : isolation === "branch" ? "branch" : "worktree";
-  assert.equal(expected, "worktree", "default isolation mode is worktree");
+  const expected = isolation === "worktree" ? "worktree" : isolation === "branch" ? "branch" : "none";
+  assert.equal(expected, "none", "default isolation mode is none");
 });
 
 // ── Mode defaults ────────────────────────────────────────────────────────────
@@ -60,9 +59,9 @@ test("solo mode applies correct defaults", () => {
   const result = applyModeDefaults("solo", { mode: "solo" });
   assert.equal(result.git?.auto_push, true);
   assert.equal(result.git?.push_branches, false);
-  assert.equal(result.git?.pre_merge_check, false);
+  assert.equal(result.git?.pre_merge_check, "auto");
   assert.equal(result.git?.merge_strategy, "squash");
-  assert.equal(result.git?.isolation, "worktree");
+  assert.equal(result.git?.isolation, "none");
   assert.equal(result.unique_milestone_ids, false);
 });
 
@@ -249,19 +248,41 @@ test("all wizard fields together produce no errors", () => {
 
 // ── Hook config ──────────────────────────────────────────────────────────────
 
-test("post-unit hook max_cycles clamping", () => {
-  assert.equal(Math.max(1, Math.min(10, Math.round(15))), 10);
-  assert.equal(Math.max(1, Math.min(10, Math.round(0))), 1);
-  assert.equal(Math.max(1, Math.min(10, Math.round(-5))), 1);
-  assert.equal(Math.max(1, Math.min(10, Math.round(3))), 3);
+test("post-unit hook max_cycles clamping via validatePreferences", () => {
+  const base = { name: "h", after: ["execute-task"], prompt: "do something" };
+
+  const { preferences: p1 } = validatePreferences({ post_unit_hooks: [{ ...base, max_cycles: 15 }] } as any);
+  assert.equal(p1.post_unit_hooks![0].max_cycles, 10, "clamps to 10");
+
+  const { preferences: p2 } = validatePreferences({ post_unit_hooks: [{ ...base, max_cycles: 0 }] } as any);
+  assert.equal(p2.post_unit_hooks![0].max_cycles, 1, "clamps to 1");
+
+  const { preferences: p3 } = validatePreferences({ post_unit_hooks: [{ ...base, max_cycles: -5 }] } as any);
+  assert.equal(p3.post_unit_hooks![0].max_cycles, 1, "negative clamps to 1");
+
+  const { preferences: p4 } = validatePreferences({ post_unit_hooks: [{ ...base, max_cycles: 3 }] } as any);
+  assert.equal(p4.post_unit_hooks![0].max_cycles, 3, "valid value passes through");
 });
 
-test("pre-dispatch hook action validation", () => {
-  const valid = new Set(["modify", "skip", "replace"]);
-  assert.ok(valid.has("modify"));
-  assert.ok(valid.has("skip"));
-  assert.ok(valid.has("replace"));
-  assert.ok(!valid.has("delete"));
+test("pre-dispatch hook action validation via validatePreferences", () => {
+  const base = { name: "h", before: ["execute-task"] };
+
+  const { preferences, errors: e1 } = validatePreferences({
+    pre_dispatch_hooks: [{ ...base, action: "skip" }],
+  } as any);
+  assert.equal(e1.length, 0);
+  assert.equal(preferences.pre_dispatch_hooks![0].action, "skip");
+
+  const { preferences: p2, errors: e2 } = validatePreferences({
+    pre_dispatch_hooks: [{ ...base, action: "modify", prepend: "note: " }],
+  } as any);
+  assert.equal(e2.length, 0);
+  assert.equal(p2.pre_dispatch_hooks![0].action, "modify");
+
+  const { errors: e3 } = validatePreferences({
+    pre_dispatch_hooks: [{ ...base, action: "delete" }],
+  } as any);
+  assert.ok(e3.some(e => e.includes("invalid action")));
 });
 
 // ── Model config parsing ─────────────────────────────────────────────────────
@@ -269,8 +290,8 @@ test("pre-dispatch hook action validation", () => {
 test("parses OpenRouter model config with org/model IDs and fallbacks", () => {
   const content = `---\nversion: 1\nmodels:\n  research:\n    model: moonshotai/kimi-k2.5\n    fallbacks:\n      - qwen/qwen3.5-397b-a17b\n  planning:\n    model: deepseek/deepseek-r1-0528\n    fallbacks:\n      - moonshotai/kimi-k2.5\n      - deepseek/deepseek-v3.2\n  execution:\n    model: qwen/qwen3-coder\n    fallbacks:\n      - qwen/qwen3-coder-next\n---\n`;
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   const research = models.research as GSDPhaseModelConfig;
   assert.equal(research.model, "moonshotai/kimi-k2.5");
   assert.deepEqual(research.fallbacks, ["qwen/qwen3.5-397b-a17b"]);
@@ -281,8 +302,8 @@ test("parses OpenRouter model config with org/model IDs and fallbacks", () => {
 test("parses model IDs with colons (OpenRouter :free, :exacto)", () => {
   const content = `---\nmodels:\n  execution:\n    model: qwen/qwen3-coder\n    fallbacks:\n      - qwen/qwen3-coder:free\n      - qwen/qwen3-coder:exacto\n---\n`;
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   const execution = models.execution as GSDPhaseModelConfig;
   assert.deepEqual(execution.fallbacks, ["qwen/qwen3-coder:free", "qwen/qwen3-coder:exacto"]);
 });
@@ -290,8 +311,8 @@ test("parses model IDs with colons (OpenRouter :free, :exacto)", () => {
 test("parses legacy string-per-phase model config", () => {
   const content = `---\nmodels:\n  research: claude-opus-4-6\n  execution: claude-sonnet-4-6\n---\n`;
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   assert.equal(models.research, "claude-opus-4-6");
   assert.equal(models.execution, "claude-sonnet-4-6");
 });
@@ -299,8 +320,8 @@ test("parses legacy string-per-phase model config", () => {
 test("strips inline YAML comments from values", () => {
   const content = `---\nmodels:\n  execution:\n    model: qwen/qwen3-coder  # fast\n    fallbacks:\n      - minimax/minimax-m2.5  # backup\n---\n`;
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   const execution = models.execution as GSDPhaseModelConfig;
   assert.equal(execution.model, "qwen/qwen3-coder");
   assert.deepEqual(execution.fallbacks, ["minimax/minimax-m2.5"]);
@@ -309,8 +330,8 @@ test("strips inline YAML comments from values", () => {
 test("handles Windows CRLF line endings", () => {
   const content = "---\r\nmodels:\r\n  execution:\r\n    model: qwen/qwen3-coder\r\n---\r\n";
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   const execution = models.execution as GSDPhaseModelConfig;
   assert.equal(execution.model, "qwen/qwen3-coder");
 });
@@ -318,8 +339,8 @@ test("handles Windows CRLF line endings", () => {
 test("handles model config with explicit provider field", () => {
   const content = `---\nmodels:\n  execution:\n    model: claude-opus-4-6\n    provider: bedrock\n    fallbacks:\n      - claude-sonnet-4-6\n---\n`;
   const prefs = parsePreferencesMarkdown(content);
-  assert.ok(prefs);
-  const models = prefs.models as GSDModelConfigV2;
+  assert.notEqual(prefs, null);
+  const models = prefs!.models as GSDModelConfigV2;
   const execution = models.execution as GSDPhaseModelConfig;
   assert.equal(execution.model, "claude-opus-4-6");
   assert.equal(execution.provider, "bedrock");
@@ -327,6 +348,116 @@ test("handles model config with explicit provider field", () => {
 
 test("handles empty models config", () => {
   const prefs = parsePreferencesMarkdown("---\nversion: 1\n---\n");
-  assert.ok(prefs);
-  assert.equal(prefs.models, undefined);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.models, undefined);
+});
+
+test("parses raw YAML blocks under headings", () => {
+  const content = `## Parallel
+enabled: true
+max_workers: 3
+`;
+  const prefs = parsePreferencesMarkdown(content);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.parallel?.enabled, true);
+  assert.equal(prefs!.parallel?.max_workers, 3);
+});
+
+test("unwraps nested top-level preference key under descriptive headings", () => {
+  const content = `## Parallel Orchestration
+parallel:
+  enabled: true
+  max_workers: 3
+`;
+  const prefs = parsePreferencesMarkdown(content);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.parallel?.enabled, true);
+  assert.equal(prefs!.parallel?.max_workers, 3);
+});
+
+test("preserves legacy heading list format", () => {
+  const content = `## Git
+- isolation: branch
+- auto_push: true
+`;
+  const prefs = parsePreferencesMarkdown(content);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.git?.isolation, "branch");
+  assert.equal(prefs!.git?.auto_push, true);
+});
+
+// ── Warn-once for unrecognized format (#2373) ────────────────────────────────
+
+test("unrecognized format warning is emitted at most once (#2373)", () => {
+  const warnings: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+  try {
+    // Reset internal warned flag so the test starts clean
+    _resetParseWarningFlag();
+
+    const unrecognized = "This is just plain text with no frontmatter or headings.";
+
+    // Call multiple times — simulates repeated preference loads
+    parsePreferencesMarkdown(unrecognized);
+    parsePreferencesMarkdown(unrecognized);
+    parsePreferencesMarkdown(unrecognized);
+
+    const relevant = warnings.filter(w => w.includes("unrecognized format"));
+    assert.equal(relevant.length, 1, `expected exactly 1 warning, got ${relevant.length}: ${JSON.stringify(relevant)}`);
+  } finally {
+    console.warn = origWarn;
+    // Reset so other tests aren't affected by the flag state
+    _resetParseWarningFlag();
+  }
+});
+
+// ── Experimental preferences ─────────────────────────────────────────────────
+
+test("experimental.rtk: true is accepted and stored", () => {
+  const result = validatePreferences({ experimental: { rtk: true } });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.preferences.experimental?.rtk, true);
+});
+
+test("experimental.rtk: false is accepted and stored", () => {
+  const result = validatePreferences({ experimental: { rtk: false } });
+  assert.deepEqual(result.errors, []);
+  assert.equal(result.preferences.experimental?.rtk, false);
+});
+
+test("experimental.rtk: non-boolean produces error", () => {
+  const result = validatePreferences({ experimental: { rtk: "yes" } } as unknown as GSDPreferences);
+  assert.ok(result.errors.some(e => e.includes("experimental.rtk")), `expected rtk error in: ${JSON.stringify(result.errors)}`);
+});
+
+test("experimental: non-object produces error", () => {
+  const result = validatePreferences({ experimental: true } as unknown as GSDPreferences);
+  assert.ok(result.errors.some(e => e.includes("experimental must be an object")));
+});
+
+test("experimental: unknown key produces warning", () => {
+  const result = validatePreferences({ experimental: { rtk: true, future_flag: true } } as unknown as GSDPreferences);
+  assert.ok(result.warnings.some(w => w.includes("future_flag")), `expected unknown-key warning in: ${JSON.stringify(result.warnings)}`);
+  assert.equal(result.preferences.experimental?.rtk, true);
+});
+
+test("experimental: omitting rtk defaults to undefined (opt-in)", () => {
+  const result = validatePreferences({ version: 1 });
+  assert.equal(result.preferences.experimental, undefined);
+});
+
+test("experimental.rtk parses correctly from preferences markdown", () => {
+  const content = "---\nversion: 1\nexperimental:\n  rtk: true\n---\n";
+  const prefs = parsePreferencesMarkdown(content);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.experimental?.rtk, true);
+});
+
+test("experimental.rtk defaults to off in new project preferences", () => {
+  // No experimental key → feature is disabled
+  const content = "---\nversion: 1\n---\n";
+  const prefs = parsePreferencesMarkdown(content);
+  assert.notEqual(prefs, null);
+  assert.equal(prefs!.experimental?.rtk, undefined);
 });
